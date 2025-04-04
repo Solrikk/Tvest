@@ -11,8 +11,12 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 
-TOKEN = "t.5dSsLgvTZ-YxPkwXCAnRTo_6ed_CxF2z6hqJ1crS0zOH8n-e5Cg"
-
+TOKEN = os.environ.get('TINKOFF_TOKEN')
+if not TOKEN:
+    print("ВНИМАНИЕ: токен Tinkoff API не найден в переменных окружения!")
+    print("Рекомендуется настроить переменную окружения TINKOFF_TOKEN для безопасной работы")
+    import getpass
+    TOKEN = getpass.getpass("Введите ваш Tinkoff API токен: ") 
 
 def get_figi_by_ticker(ticker: str) -> str:
     with Client(TOKEN) as client:
@@ -30,7 +34,9 @@ def get_figi_by_ticker(ticker: str) -> str:
 
 
 async def fetch_candles(figi: str, days: int = 90):
-    candles = []
+    hourly_candles = []
+    minute_candles = []
+    
     async with AsyncClient(TOKEN) as client:
         async for candle in client.get_all_candles(
                 figi=figi,
@@ -38,13 +44,14 @@ async def fetch_candles(figi: str, days: int = 90):
                 to=now() - timedelta(minutes=60),
                 interval=CandleInterval.CANDLE_INTERVAL_HOUR,
         ):
-            candles.append({
+            hourly_candles.append({
                 'time': candle.time,
                 'open': float(quotation_to_decimal(candle.open)),
                 'high': float(quotation_to_decimal(candle.high)),
                 'low': float(quotation_to_decimal(candle.low)),
                 'close': float(quotation_to_decimal(candle.close)),
-                'volume': candle.volume
+                'volume': candle.volume,
+                'timeframe': 'hour'
             })
 
         async for candle in client.get_all_candles(
@@ -53,39 +60,120 @@ async def fetch_candles(figi: str, days: int = 90):
                 to=now(),
                 interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
         ):
-            candles.append({
+            minute_candles.append({
                 'time': candle.time,
                 'open': float(quotation_to_decimal(candle.open)),
                 'high': float(quotation_to_decimal(candle.high)),
                 'low': float(quotation_to_decimal(candle.low)),
                 'close': float(quotation_to_decimal(candle.close)),
-                'volume': candle.volume
+                'volume': candle.volume,
+                'timeframe': 'minute'
             })
 
-    df = pd.DataFrame(candles)
-    if not df.empty:
-        df['time'] = pd.to_datetime(df['time'])
-        df.sort_values('time', inplace=True)
-        df.set_index('time', inplace=True)
-    return df
+    df_hour = pd.DataFrame(hourly_candles)
+    df_minute = pd.DataFrame(minute_candles)
+    
+    if not df_hour.empty and not df_minute.empty:
+        if len(df_minute) >= 30:
+            df_minute['time'] = pd.to_datetime(df_minute['time'])
+            df_minute.set_index('time', inplace=True)
+            
+            minute_to_hour = df_minute.resample('1h').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).reset_index()
+            
+            minute_to_hour['timeframe'] = 'hour_from_minute'
+            
+            # Объединяем с часовыми данными
+            all_candles = pd.concat([df_hour, minute_to_hour])
+        else:
+            # Просто объединяем данные
+            all_candles = pd.concat([df_hour, df_minute])
+    elif not df_hour.empty:
+        all_candles = df_hour
+    elif not df_minute.empty:
+        all_candles = df_minute
+    else:
+        return pd.DataFrame() 
+
+    if not all_candles.empty:
+        all_candles['time'] = pd.to_datetime(all_candles['time'])
+        all_candles.sort_values('time', inplace=True)
+        all_candles.set_index('time', inplace=True)
+        
+        # Сохраняем информацию о последней рыночной цене
+        all_candles["last_raw_close"] = all_candles["close"].iloc[-1] if not all_candles.empty else None
+        
+    return all_candles
 
 
 def preprocess_data(df: pd.DataFrame):
+    if df.empty:
+        return df
+        
     df["last_raw_close"] = df["close"].iloc[-1] if not df.empty else None
 
-    df["close_smooth"] = df["close"].rolling(window=2, min_periods=1).mean()
-    roll_med = df["close_smooth"].rolling(window=10, min_periods=1).median()
-    roll_std = df["close_smooth"].rolling(window=10, min_periods=1).std().fillna(0)
+    df = df.sort_index()
+    
+    hourly_data = df[df['timeframe'] == 'hour'].copy()
+    if not hourly_data.empty:
+        expected_hours = pd.date_range(start=hourly_data.index.min(), 
+                                      end=hourly_data.index.max(), 
+                                      freq='h')
+        
+        missing_hours = expected_hours.difference(hourly_data.index)
+        if len(missing_hours) > 0:
+            print(f"Обнаружено {len(missing_hours)} пропущенных часовых интервалов (возможно нерыночные часы)")
+            
+            missing_percent = len(missing_hours) / len(expected_hours) * 100
+            if missing_percent < 30:
+                print(f"Заполняем {len(missing_hours)} пропущенных интервалов (возможно аномалии)")
+                for missing_hour in missing_hours:
+                    closest_before = hourly_data[hourly_data.index < missing_hour].iloc[-1] if not hourly_data[hourly_data.index < missing_hour].empty else None
+                    closest_after = hourly_data[hourly_data.index > missing_hour].iloc[0] if not hourly_data[hourly_data.index > missing_hour].empty else None
+                    
+                    if closest_before is not None and closest_after is not None:
+                        time_delta = (closest_after.name - closest_before.name).total_seconds()
+                        time_ratio = (missing_hour - closest_before.name).total_seconds() / time_delta
+                        
+                        new_row = closest_before.copy()
+                        for col in ['open', 'high', 'low', 'close']:
+                            new_row[col] = closest_before[col] + time_ratio * (closest_after[col] - closest_before[col])
+                        
+                        new_row['volume'] = int((closest_before['volume'] + closest_after['volume']) / 2)
+                        new_row.name = missing_hour
+                        df.loc[missing_hour] = new_row
 
-    diff = np.abs(df["close_smooth"] - roll_med)
-    threshold = 2.5 * roll_std
-
-    df["close_clean"] = np.where(diff > threshold, roll_med, df["close_smooth"])
-
+    min_periods = min(2, len(df))
+    df["close_smooth"] = df["close"].rolling(window=2, min_periods=min_periods).mean()
+    
+    window_size = min(10, len(df))
+    if window_size < 4:
+        print("Предупреждение: Недостаточно данных для надежной обработки выбросов")
+        df["close_clean"] = df["close_smooth"]  # Без обработки выбросов при малом количестве данных
+    else:
+        roll_med = df["close_smooth"].rolling(window=window_size, min_periods=min_periods).median()
+        roll_std = df["close_smooth"].rolling(window=window_size, min_periods=min_periods).std().fillna(0)
+        
+        # Определяем выбросы с адаптивным порогом
+        diff = np.abs(df["close_smooth"] - roll_med)
+        threshold_factor = 3.0 if len(df) > 30 else 4.0  
+        threshold = threshold_factor * roll_std
+        
+        df["close_clean"] = np.where(diff > threshold, roll_med, df["close_smooth"])
+    
+    # Последний час всегда оставляем как есть, поскольку это текущие рыночные данные
     last_hour_mask = df.index >= (df.index.max() - pd.Timedelta(hours=1))
     if any(last_hour_mask):
         df.loc[last_hour_mask, "close_clean"] = df.loc[last_hour_mask, "close"]
-
+    
+    # Заполняем возможные NaN после всех операций
+    df["close_clean"] = df["close_clean"].fillna(df["close"])
+    
     return df
 
 
@@ -134,12 +222,12 @@ def create_features(df: pd.DataFrame, lags: int = 3):
     for i in range(1, lags + 1):
         lag_col = f'lag_{i}'
         if lag_col in df.columns:
-            df[lag_col] = df[lag_col].fillna(method='bfill').fillna(method='ffill')
+            df[lag_col] = df[lag_col].bfill().ffill()
 
     for col in ["sma20", "ema20", "rsi", "macd", "macd_signal", "bb_upper", "bb_lower",
                 "stoch", "ema50", "vol_ma20"]:
         if col in df.columns and df[col].isna().any():
-            df[col] = df[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
+            df[col] = df[col].ffill().bfill().fillna(0)
 
     df = create_fourier_features(df)
 
@@ -161,201 +249,392 @@ def create_features(df: pd.DataFrame, lags: int = 3):
 
 
 def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
+    # Импортируем StandardScaler в начале функции
+    from sklearn.preprocessing import StandardScaler
+    
+    if len(df) < 30:
+        print("Предупреждение: Недостаточно данных для надежного обучения модели.")
+        # Возвращаем простую наивную модель вместо сложной
+        from sklearn.dummy import DummyRegressor
+        dummy_model = DummyRegressor(strategy="mean")
+        dummy_model.fit(np.array([[0]]), np.array([df["close_clean"].mean()]))
+        
+        # Создаем пустые масштабировщики
+        scaler_X = StandardScaler()
+        scaler_X.fit(np.array([[0]]))
+        scaler_y = StandardScaler()
+        scaler_y.fit(np.array([[0]]))
+        
+        return dummy_model, scaler_X, scaler_y, ["dummy_feature"], df
+        
     df_feat, feature_cols = create_features(df.copy(), lags)
 
-    if len(df_feat) < 30:
-        print("Предупреждение: Недостаточно данных для надежного обучения модели.")
+    # Проверка стационарности временного ряда
+    from statsmodels.tsa.stattools import adfuller
+    
+    # Проверяем ряд цен на стационарность
+    adf_result = adfuller(df_feat['close_clean'].dropna())
+    
+    if adf_result[1] > 0.05:
+        print(f"Предупреждение: Ряд цен нестационарен (p-value: {adf_result[1]:.4f}). Рассмотрите использование разностей.")
+        # Создаем признак разности цен для улучшения стационарности
+        df_feat['price_diff'] = df_feat['close_clean'].diff().fillna(0)
+        if 'price_diff' not in feature_cols:
+            feature_cols.append('price_diff')
+    else:
+        print(f"Временной ряд стационарен (p-value: {adf_result[1]:.4f})")
 
-    train_size = int(len(df_feat) * 0.8)
-    train_df = df_feat.iloc[:train_size]
-    valid_df = df_feat.iloc[train_size:]
+    # Правильное разделение на обучающую и тестовую выборки для временных рядов
+    # Используем строго последовательный подход - последние 20% данных для тестирования
+    test_size = int(len(df_feat) * 0.2)
+    train_df = df_feat.iloc[:-test_size] if test_size > 0 else df_feat.copy()
+    test_df = df_feat.iloc[-test_size:] if test_size > 0 else pd.DataFrame()
+    
+    # Создаем кросс-валидацию внутри тренировочного набора
+    from sklearn.model_selection import TimeSeriesSplit
+    tscv = TimeSeriesSplit(n_splits=3)  # Уменьшено для более стабильных результатов
 
-    X = df_feat[feature_cols].values
-    y = df_feat['close_clean'].values.reshape(-1, 1)
-
-    for i in range(X.shape[1]):
-        col_data = X[:, i]
+    X_train = train_df[feature_cols].values
+    y_train = train_df['close_clean'].values.reshape(-1, 1)
+    
+    # Удаление выбросов только из тренировочного набора
+    lower_bounds = {}
+    upper_bounds = {}
+    for i in range(X_train.shape[1]):
+        col_data = X_train[:, i]
         q1, q3 = np.percentile(col_data, [25, 75])
         iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-        X[:, i] = np.clip(col_data, lower_bound, upper_bound)
+        lower_bounds[i] = q1 - 1.5 * iqr
+        upper_bounds[i] = q3 + 1.5 * iqr
+        X_train[:, i] = np.clip(col_data, lower_bounds[i], upper_bounds[i])
 
+    # Масштабируем данные после удаления выбросов
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y).ravel()
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    y_train_scaled = scaler_y.fit_transform(y_train).ravel()
 
-    from sklearn.linear_model import Ridge
-    model = Ridge(alpha=0.1).fit(X_scaled, y_scaled)
+    # Оцениваем различные типы моделей для выбора наилучшей
+    from sklearn.linear_model import Ridge, ElasticNet
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    
+    # Тестируем несколько типов моделей, адаптируем сложность к размеру данных
+    if len(X_train) < 50:
+        # Для маленьких выборок используем более простые модели
+        models = {
+            'ridge': Ridge(),
+            'elasticnet': ElasticNet(random_state=42, alpha=1.0)
+        }
+    else:
+        # Для больших выборок можем позволить более сложные модели
+        models = {
+            'ridge': Ridge(),
+            'elasticnet': ElasticNet(random_state=42),
+            'gbr': GradientBoostingRegressor(n_estimators=50, max_depth=3, random_state=42)
+        }
+    
+    best_model_name = None
+    best_model = None
+    best_params = None
+    best_score = -float('inf')
+    
+    # Простая оптимизация гиперпараметров
+    for model_name, model in models.items():
+        if model_name == 'ridge':
+            param_grid = {'alpha': [0.01, 0.1, 1.0, 10.0]}
+        elif model_name == 'elasticnet':
+            param_grid = {'alpha': [0.01, 0.1, 1.0], 'l1_ratio': [0.1, 0.5, 0.9]}
+        elif model_name == 'gbr':
+            param_grid = {'learning_rate': [0.01, 0.1]}
+        
+        best_param_score = -float('inf')
+        best_model_params = None
+        
+        # Перебор параметров
+        import itertools
+        param_combinations = list(itertools.product(*param_grid.values()))
+        param_names = list(param_grid.keys())
+        
+        for params in param_combinations:
+            param_dict = {name: value for name, value in zip(param_names, params)}
+            model.set_params(**param_dict)
+            
+            cv_scores = []
+            for train_idx, val_idx in tscv.split(X_train_scaled):
+                X_cv_train, X_cv_val = X_train_scaled[train_idx], X_train_scaled[val_idx]
+                y_cv_train, y_cv_val = y_train_scaled[train_idx], y_train_scaled[val_idx]
+                
+                model.fit(X_cv_train, y_cv_train)
+                pred_val = model.predict(X_cv_val)
+                r2 = r2_score(y_cv_val, pred_val)
+                cv_scores.append(r2)
+            
+            mean_score = np.mean(cv_scores)
+            if mean_score > best_param_score:
+                best_param_score = mean_score
+                best_model_params = param_dict
+        
+        # Если эта модель лучше предыдущих, сохраняем её
+        if best_param_score > best_score:
+            best_score = best_param_score
+            best_model_name = model_name
+            best_params = best_model_params
+    
+    # Создаем и обучаем лучшую модель
+    if best_model_name == 'ridge':
+        best_model = Ridge(**best_params)
+    elif best_model_name == 'elasticnet':
+        best_model = ElasticNet(**best_params, random_state=42)
+    elif best_model_name == 'gbr':
+        best_model = GradientBoostingRegressor(**best_params, n_estimators=50, max_depth=3, random_state=42)
+    
+    print(f"Выбрана модель: {best_model_name} с параметрами: {best_params}, средний R²: {best_score:.4f}")
+    
+    # Обучаем окончательную модель на всех тренировочных данных
+    best_model.fit(X_train_scaled, y_train_scaled)
+    
+    # Проверка на тестовых данных
+    if len(test_df) > 0:
+        X_test = test_df[feature_cols].values
+        y_test = test_df['close_clean'].values
 
-    if len(valid_df) > 0:
-        X_valid = valid_df[feature_cols].values
-        y_valid = valid_df['close_clean'].values
+        # Применяем те же ограничения к тестовым данным, чтобы избежать утечки
+        for i in range(X_test.shape[1]):
+            if i in lower_bounds:  # Проверка на случай изменения признаков
+                X_test[:, i] = np.clip(X_test[:, i], lower_bounds[i], upper_bounds[i])
 
-        for i in range(X_valid.shape[1]):
-            col_data = X_valid[:, i]
-            X_valid[:, i] = np.clip(col_data, lower_bound, upper_bound)
+        X_test_scaled = scaler_X.transform(X_test)
+        
+        # Получаем предсказания
+        pred_test_scaled = best_model.predict(X_test_scaled)
+        pred_test = scaler_y.inverse_transform(pred_test_scaled.reshape(-1, 1)).ravel()
 
-        X_valid_scaled = scaler_X.transform(X_valid)
-        y_valid_scaled = scaler_y.transform(y_valid.reshape(-1, 1)).ravel()
+        # Оцениваем качество модели
+        mae = mean_absolute_error(y_test, pred_test)
+        rmse = np.sqrt(mean_squared_error(y_test, pred_test))
+        r2 = r2_score(y_test, pred_test)
+        
+        # Вычисляем точность направления
+        direction_pred = np.sign(np.diff(np.append([y_test[0]], pred_test)))
+        direction_actual = np.sign(np.diff(y_test))
+        direction_accuracy = np.mean(direction_pred[:-1] == direction_actual) * 100  # последний элемент отбрасываем
 
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-        pred_valid_scaled = model.predict(X_valid_scaled)
-        pred_valid = scaler_y.inverse_transform(pred_valid_scaled.reshape(-1, 1)).ravel()
+        print(f"Тестирование модели: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
+        print(f"Точность направления движения: {direction_accuracy:.2f}%")
 
-        mae = mean_absolute_error(y_valid, pred_valid)
-        rmse = np.sqrt(mean_squared_error(y_valid, pred_valid))
-        r2 = r2_score(y_valid, pred_valid)
+        # Наивная модель для сравнения (предыдущее значение)
+        naive_pred = np.roll(y_test, 1)
+        naive_pred[0] = y_test[0]
+        naive_mae = mean_absolute_error(y_test[1:], naive_pred[1:])
+        naive_rmse = np.sqrt(mean_squared_error(y_test[1:], naive_pred[1:]))
+        
+        print(f"Наивная модель: MAE={naive_mae:.4f}, RMSE={naive_rmse:.4f}")
+        
+        # Сравнение с наивной моделью
+        if rmse >= naive_rmse:
+            print("Предупреждение: Модель не превосходит наивный прогноз. Требуется улучшение.")
+        elif r2 < 0.3:
+            print("Предупреждение: Низкое качество прогнозов. Рекомендуется пересмотреть признаки или увеличить объем данных.")
 
-        print(f"Валидация модели: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
-
-        if r2 < 0.5:
-            print("Предупреждение: Низкое качество прогнозов. Рекомендуется увеличить объем данных.")
-
-    return model, scaler_X, scaler_y, feature_cols, df_feat
+    return best_model, scaler_X, scaler_y, feature_cols, df_feat
 
 
 def predict_multiple_steps_enhanced(df: pd.DataFrame,
                                     steps: int = 5,
                                     lags: int = 3):
+    if df.empty:
+        print("Ошибка: нет данных для прогнозирования")
+        return [df["close"].iloc[-1] if not df.empty else 0] * steps
+        
     model, scaler_X, scaler_y, feature_cols, df_feat = train_model_enhanced(
         df, lags)
 
-    pred_df = df_feat.tail(1).copy()
-
-    current_features = []
-    for col in feature_cols:
-        value = pred_df[col].iloc[-1]
-        if pd.isna(value):
-            value = df_feat[col].mean()
-            if pd.isna(value):
-                value = 0
-        current_features.append(value)
-
-    feature_vector_np = np.array(current_features).reshape(1, -1)
-    if np.isnan(feature_vector_np).any():
-        feature_vector_np = np.nan_to_num(feature_vector_np, nan=0.0)
-
-    feature_vector_scaled = scaler_X.transform(feature_vector_np)
-
-    pred_scaled = model.predict(feature_vector_scaled)
-    pred_1min = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0, 0]
-
+    # Для итеративного прогнозирования
     time_intervals = [1, 5, 15, 30]
     predictions = []
-
-    last_n_values = df['close_clean'].tail(60).values
-    last_values_diff = np.diff(last_n_values)
-
-    mean_change = np.mean(last_values_diff)
-    median_change = np.median(last_values_diff)
-    std_change = np.std(last_values_diff)
-
-    trend_strength = mean_change / (std_change if std_change > 0 else 0.0001)
-
-    consecutive_up = 0
-    consecutive_down = 0
-    for i in range(len(last_values_diff) - 1, 0, -1):
-        if last_values_diff[i] > 0:
-            consecutive_up += 1
-            consecutive_down = 0
-        elif last_values_diff[i] < 0:
-            consecutive_down += 1
-            consecutive_up = 0
-        else:
-            consecutive_up = 0
-            consecutive_down = 0
-
-    tech_indicators_bullish = 0
-    tech_indicators_bearish = 0
-
-    if df['rsi'].iloc[-1] < 30:
-        tech_indicators_bullish += 1
-    elif df['rsi'].iloc[-1] > 70:
-        tech_indicators_bearish += 1
-
-    if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1]:
-        tech_indicators_bullish += 1
-    else:
-        tech_indicators_bearish += 1
-
-    bb_position = (df['close_clean'].iloc[-1] - df['bb_lower'].iloc[-1]) / (df['bb_upper'].iloc[-1] - df['bb_lower'].iloc[-1])
-    if bb_position < 0.2:
-        tech_indicators_bullish += 1
-    elif bb_position > 0.8:
-        tech_indicators_bearish += 1
-
-    if df['close_clean'].iloc[-1] > df['ema20'].iloc[-1] and df['ema20'].iloc[-1] > df['ema50'].iloc[-1]:
-        tech_indicators_bullish += 1
-    elif df['close_clean'].iloc[-1] < df['ema20'].iloc[-1] and df['ema20'].iloc[-1] < df['ema50'].iloc[-1]:
-        tech_indicators_bearish += 1
-
-    indicator_consensus = tech_indicators_bullish - tech_indicators_bearish
-
+    
+    # Копируем последние данные для обновления
+    last_data = df_feat.tail(1).copy()
+    current_close = df['close_clean'].iloc[-1]
+    
+    # Получаем все необходимые признаки для начальной точки прогноза
     for interval in time_intervals:
         if interval == 1:
-            base_prediction = pred_1min
-
-            adjustment_factor = 0.001 * indicator_consensus * df['close_clean'].iloc[-1]
-            predictions.append(base_prediction + adjustment_factor)
-            continue
-
-        base_forecast = pred_1min + (mean_change * interval)
-
-        trend_adjustment = trend_strength * std_change * np.sqrt(interval) * 0.5
-
-        tech_adjustment = 0.002 * indicator_consensus * df['close_clean'].iloc[-1] * (interval / 5)
-
-        momentum_adjustment = 0
-        if consecutive_up > 3:
-            momentum_adjustment = 0.001 * consecutive_up * df['close_clean'].iloc[-1] * (interval / 10)
-        elif consecutive_down > 3:
-            momentum_adjustment = -0.001 * consecutive_down * df['close_clean'].iloc[-1] * (interval / 10)
-
-        volatility_adjustment = std_change * np.sqrt(interval) * 0.3
-
-        contrarian_adjustment = 0
-        if df['rsi'].iloc[-1] > 75:
-            contrarian_adjustment = -0.003 * (df['rsi'].iloc[-1] - 75) * df['close_clean'].iloc[-1] * (interval / 15)
-        elif df['rsi'].iloc[-1] < 25:
-            contrarian_adjustment = 0.003 * (25 - df['rsi'].iloc[-1]) * df['close_clean'].iloc[-1] * (interval / 15)
-
-        if interval <= 5:
-            final_prediction = (
-                base_forecast + 
-                trend_adjustment * 0.6 +
-                tech_adjustment * 0.2 +
-                momentum_adjustment * 0.15 +
-                volatility_adjustment * 0.05 +
-                contrarian_adjustment * 0.0
-            )
-        elif interval <= 15:
-            final_prediction = (
-                base_forecast +
-                trend_adjustment * 0.4 +
-                tech_adjustment * 0.25 +
-                momentum_adjustment * 0.15 +
-                volatility_adjustment * 0.1 +
-                contrarian_adjustment * 0.1
-            )
+            # Получаем прогноз для первого шага
+            current_features = []
+            for col in feature_cols:
+                value = last_data[col].iloc[-1]
+                if pd.isna(value):
+                    value = df_feat[col].mean()
+                    if pd.isna(value):
+                        value = 0
+                current_features.append(value)
+            
+            feature_vector_np = np.array(current_features).reshape(1, -1)
+            if np.isnan(feature_vector_np).any():
+                feature_vector_np = np.nan_to_num(feature_vector_np, nan=0.0)
+            
+            feature_vector_scaled = scaler_X.transform(feature_vector_np)
+            pred_scaled = model.predict(feature_vector_scaled)
+            pred_1min = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0, 0]
+            
+            # Собираем технические индикаторы для корректировки
+            tech_indicators_bullish = 0
+            tech_indicators_bearish = 0
+            
+            if df['rsi'].iloc[-1] < 30:
+                tech_indicators_bullish += 1
+            elif df['rsi'].iloc[-1] > 70:
+                tech_indicators_bearish += 1
+            
+            if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1]:
+                tech_indicators_bullish += 1
+            else:
+                tech_indicators_bearish += 1
+            
+            bb_position = (df['close_clean'].iloc[-1] - df['bb_lower'].iloc[-1]) / (df['bb_upper'].iloc[-1] - df['bb_lower'].iloc[-1])
+            if bb_position < 0.2:
+                tech_indicators_bullish += 1
+            elif bb_position > 0.8:
+                tech_indicators_bearish += 1
+            
+            if df['close_clean'].iloc[-1] > df['ema20'].iloc[-1] and df['ema20'].iloc[-1] > df['ema50'].iloc[-1]:
+                tech_indicators_bullish += 1
+            elif df['close_clean'].iloc[-1] < df['ema20'].iloc[-1] and df['ema20'].iloc[-1] < df['ema50'].iloc[-1]:
+                tech_indicators_bearish += 1
+            
+            indicator_consensus = tech_indicators_bullish - tech_indicators_bearish
+            
+            # Небольшая корректировка на основе индикаторов
+            adjustment_factor = 0.001 * indicator_consensus * current_close
+            predictions.append(pred_1min + adjustment_factor)
+            
+            # Сохраняем прогноз для следующих шагов
+            predicted_value = pred_1min
         else:
-            final_prediction = (
-                base_forecast +
-                trend_adjustment * 0.25 +
-                tech_adjustment * 0.2 +
-                momentum_adjustment * 0.1 +
-                volatility_adjustment * 0.2 +
-                contrarian_adjustment * 0.25
-            )
-
-        predictions.append(final_prediction)
+            # Для каждого следующего интервала создаем новое состояние данных
+            # с учетом предыдущих прогнозов
+            prev_predictions = predictions.copy()
+            
+            # Выполняем несколько прогнозов с интервалом между ними
+            # для более точного предсказания на больший период
+            step_size = 1
+            steps_num = interval // step_size
+            
+            # Инициализируем с последнего известного состояния
+            temp_df = last_data.copy()
+            last_predicted = current_close
+            next_predicted = None
+            
+            for step in range(steps_num):
+                # Обновляем лаги на основе предыдущих прогнозов
+                for i in range(1, lags + 1):
+                    lag_idx = lags - i
+                    if lag_idx < len(prev_predictions):
+                        temp_df[f'lag_{i}'] = prev_predictions[lag_idx]
+                    else:
+                        temp_df[f'lag_{i}'] = last_predicted
+                
+                # Обновляем текущее значение для технических индикаторов
+                # В реальном сценарии нужно было бы пересчитать все технические индикаторы,
+                # здесь мы делаем упрощенную версию
+                if step > 0:
+                    # Правильно пересчитываем индикаторы для более точного прогноза
+                    # Создаем копию последних данных с новым предсказанным значением
+                    last_prices = list(df['close_clean'].tail(50).values)  # Берем последние 50 значений для расчета
+                    
+                    # Проверяем, что next_predicted не None
+                    if next_predicted is not None:
+                        last_prices.append(next_predicted)  # Добавляем новое предсказанное значение
+                    
+                    # Убеждаемся, что у нас достаточно данных
+                    if len(last_prices) >= 20:
+                        # Пересчитываем основные индикаторы
+                        ema20 = np.average(last_prices[-20:], weights=[1+(i/20) for i in range(20)])
+                        sma20 = np.mean(last_prices[-20:])
+                        
+                        # Проверяем достаточно ли данных для RSI
+                        if len(last_prices) >= 15:
+                            # Простое обновление RSI
+                            deltas = np.diff(last_prices[-15:])
+                            gains = np.where(deltas > 0, deltas, 0)
+                            losses = np.where(deltas < 0, -deltas, 0)
+                            avg_gain = np.mean(gains)
+                            avg_loss = np.mean(losses) if np.mean(losses) != 0 else 0.0001
+                            rs = avg_gain / avg_loss
+                            rsi = 100 - (100 / (1 + rs))
+                        else:
+                            # Если недостаточно данных, используем текущее значение RSI
+                            rsi = temp_df['rsi'].iloc[-1]
+                    else:
+                        # Если недостаточно данных, используем текущие значения
+                        ema20 = temp_df['ema20'].iloc[-1]
+                        sma20 = temp_df['sma20'].iloc[-1]
+                        rsi = temp_df['rsi'].iloc[-1]
+                    
+                    update_features = []
+                    for col in feature_cols:
+                        if col.startswith('lag_'):
+                            value = temp_df[col].iloc[-1]
+                        elif col == 'ema20':
+                            value = ema20
+                        elif col == 'sma20':
+                            value = sma20
+                        elif col == 'rsi':
+                            value = rsi
+                        elif col == 'price_diff' and 'price_diff' in feature_cols:
+                            # Проверяем, что оба значения не None
+                            if next_predicted is not None and last_predicted is not None:
+                                value = next_predicted - last_predicted
+                            else:
+                                value = 0  # Безопасное значение по умолчанию
+                        else:
+                            # Остальные индикаторы пока оставляем прежними из-за сложности расчета
+                            value = temp_df[col].iloc[-1]
+                        
+                        # Проверяем, что значение не None
+                        if value is None:
+                            value = 0  # Безопасное значение по умолчанию
+                            
+                        update_features.append(value)
+                    
+                    update_vector = np.array(update_features).reshape(1, -1)
+                    if np.isnan(update_vector).any():
+                        update_vector = np.nan_to_num(update_vector, nan=0.0)
+                    
+                    # Получаем прогноз для следующего шага
+                    update_scaled = scaler_X.transform(update_vector)
+                    new_pred_scaled = model.predict(update_scaled)
+                    next_predicted = scaler_y.inverse_transform(new_pred_scaled.reshape(-1, 1))[0, 0]
+                    
+                    # Сохраняем для следующего шага
+                    last_predicted = next_predicted
+                    prev_predictions.append(next_predicted)
+            
+            # Финальный прогноз для данного интервала
+            if next_predicted is not None:
+                predictions.append(next_predicted)
+            else:
+                # Если по какой-то причине не получилось сделать итеративный прогноз,
+                # используем упрощенную версию как запасной вариант
+                last_n_values = df['close_clean'].tail(60).values
+                last_values_diff = np.diff(last_n_values)
+                mean_change = np.mean(last_values_diff)
+                std_change = np.std(last_values_diff)
+                
+                base_forecast = predictions[0] + (mean_change * interval)
+                predictions.append(base_forecast)
 
     return predictions
 
 
 def detect_regime(df: pd.DataFrame):
     try:
+        if len(df) < 30:  # Проверка наличия достаточного количества данных
+            print("Недостаточно данных для определения режима рынка")
+            return {}
+            
         mr = MarkovRegression(df["close_clean"],
                               k_regimes=2,
                               trend='c',
@@ -364,6 +643,7 @@ def detect_regime(df: pd.DataFrame):
         regimes = res.smoothed_marginal_probabilities.iloc[-1].to_dict()
         return regimes
     except Exception as e:
+        print(f"Ошибка при определении режима рынка: {e}")
         return {}
 
 
@@ -372,6 +652,33 @@ def analyze_market(ind, current_price, predictions, df=None):
     score_bear = 0
     reason_bull = []
     reason_bear = []
+    
+    # Проверка наличия экстремальных рыночных условий
+    try:
+        # Проверка повышенной волатильности
+        if df is not None and len(df) > 20:
+            recent_volatility = df['close_clean'].pct_change().rolling(window=5).std().iloc[-1]
+            historical_volatility = df['close_clean'].pct_change().rolling(window=20).std().iloc[-1]
+            
+            if recent_volatility > historical_volatility * 2:
+                score_bear += 2
+                reason_bear.append(f"Экстремальная волатильность (x{recent_volatility/historical_volatility:.1f})")
+                
+        # Проверка на гэпы в цене (если данные обновлялись после закрытия и открытия рынка)
+        if df is not None and len(df) > 1:
+            last_close = df['close_clean'].iloc[-2]
+            current_open = df['open'].iloc[-1]
+            if abs(current_open - last_close) / last_close > 0.02:  # гэп более 2%
+                gap_direction = "верх" if current_open > last_close else "вниз"
+                gap_size = abs(current_open - last_close) / last_close * 100
+                if gap_direction == "верх":
+                    score_bull += 2
+                    reason_bull.append(f"Гэп вверх {gap_size:.1f}%")
+                else:
+                    score_bear += 2
+                    reason_bear.append(f"Гэп вниз {gap_size:.1f}%")
+    except Exception as e:
+        print(f"Предупреждение: ошибка при анализе рыночных условий: {e}")
 
     if ind["rsi"] < 30:
         score_bull += 2
@@ -668,8 +975,41 @@ def clear_terminal():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
+def calculate_risk_metrics(df, current_price, predictions):
+    # Расчет простого Value at Risk (VaR) на основе исторической волатильности
+    if df is None or len(df) < 30:
+        return {"var_95": 0, "max_loss_pct": 0, "risk_level": "Неизвестно"}
+        
+    returns = df['close_clean'].pct_change().dropna()
+    if len(returns) < 20:
+        return {"var_95": 0, "max_loss_pct": 0, "risk_level": "Недостаточно данных"}
+    
+    # Расчет 95% VaR (потенциальная потеря с 95% уверенностью)
+    var_95 = abs(returns.quantile(0.05) * current_price)
+    var_95_pct = abs(returns.quantile(0.05) * 100)
+    
+    # Максимальная историческая просадка за последние 30 дней
+    rolling_max = df['close_clean'].rolling(window=30).max()
+    daily_drawdown = df['close_clean'] / rolling_max - 1.0
+    max_loss_pct = abs(daily_drawdown.min() * 100)
+    
+    # Определение уровня риска
+    if var_95_pct > 5:
+        risk_level = "Высокий"
+    elif var_95_pct > 2:
+        risk_level = "Средний"
+    else:
+        risk_level = "Низкий"
+        
+    return {
+        "var_95": var_95,
+        "var_95_pct": var_95_pct,
+        "max_loss_pct": max_loss_pct,
+        "risk_level": risk_level
+    }
+
 def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
-                 indicators, regimes, analysis, accuracy_stats=None):
+                 indicators, regimes, analysis, accuracy_stats=None, risk_metrics=None):
     predicted_price = predictions[0]
     trend_symbol = "↑" if predicted_price > last_close else "↓" if predicted_price < last_close else "-"
     color_pred = "\033[1;32m" if predicted_price > last_close else "\033[1;31m" if predicted_price < last_close else "\033[0m"
@@ -759,6 +1099,24 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
 
         accuracy_info += f"\n ОБЩАЯ ОЦЕНКА МОДЕЛИ: {accuracy_desc}\n"
 
+    # Добавляем информацию о риске
+    risk_info = ""
+    if risk_metrics:
+        risk_color = ""
+        if risk_metrics["risk_level"] == "Высокий":
+            risk_color = "\033[1;31m"  # красный
+        elif risk_metrics["risk_level"] == "Средний":
+            risk_color = "\033[1;33m"  # желтый
+        elif risk_metrics["risk_level"] == "Низкий":
+            risk_color = "\033[1;32m"  # зеленый
+            
+        risk_info = (
+            "------------------------------------------------------------\n"
+            f" ОЦЕНКА РИСКА: {risk_color}{risk_metrics['risk_level']}{reset}\n"
+            f"  Value at Risk (95%): {risk_metrics['var_95']:.2f} ({risk_metrics.get('var_95_pct', 0):.2f}%)\n"
+            f"  Макс. историческая просадка: {risk_metrics['max_loss_pct']:.2f}%\n"
+        )
+    
     report = (
         "============================================================\n"
         f" ТИКЕР: {ticker.upper()}    FIGI: {figi}\n"
@@ -771,6 +1129,7 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
         "------------------------------------------------------------\n"
         " Прогнозируемые цены по интервалам:\n" + multi_preds_str + "\n"
         + accuracy_info +
+        risk_info +
         "------------------------------------------------------------\n"
         f" Режим рынка: {regime_str}\n"
         f" Индикаторы: {rep_ind}\n"
@@ -782,63 +1141,116 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
 
 async def main():
     ticker = input("Введите тикер: ")
-    figi = get_figi_by_ticker(ticker)
-
+    try:
+        figi = get_figi_by_ticker(ticker)
+    except ValueError as e:
+        print(f"Ошибка: {e}")
+        return
+        
     prediction_tracker = PredictionTracker(ticker)
+    last_update_time = datetime.now() - timedelta(minutes=10)  # Инициализация для первого прогноза
+    model_update_interval = timedelta(minutes=30)  # Обновляем модель каждые 30 минут
+    data_update_interval = timedelta(seconds=10)  # Обновляем данные каждые 10 секунд
 
     async def get_current_price():
-        try:
-            async with AsyncClient(TOKEN) as client:
-                response = await client.market_data.get_last_prices(figi=[figi])
-                if response and response.last_prices:
-                    return float(quotation_to_decimal(response.last_prices[0].price))
-                return None
-        except Exception as e:
-            print(f"Ошибка при получении текущей цены: {e}")
-            return None
-
+        retry_count = 0
+        max_retries = 3
+        retry_delay = 2  # секунды
+        
+        while retry_count < max_retries:
+            try:
+                async with AsyncClient(TOKEN) as client:
+                    response = await client.market_data.get_last_prices(figi=[figi])
+                    if response and response.last_prices:
+                        return float(quotation_to_decimal(response.last_prices[0].price))
+                    
+                    print(f"Предупреждение: API вернул пустой результат (попытка {retry_count+1}/{max_retries})")
+                    retry_count += 1
+                    
+            except Exception as e:
+                print(f"Ошибка при получении текущей цены: {e} (попытка {retry_count+1}/{max_retries})")
+                retry_count += 1
+                
+            if retry_count < max_retries:
+                print(f"Повторная попытка через {retry_delay} сек...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Увеличиваем задержку при каждой повторной попытке
+                
+        print("Не удалось получить текущую цену после нескольких попыток")
+        # Возвращаем кешированное значение, если оно есть
+        if df_cache is not None and "last_raw_close" in df_cache:
+            print(f"Используем последнюю известную цену: {df_cache['last_raw_close']}")
+            return df_cache["last_raw_close"]
+        return None
+    
+    # Кэшируем последние данные
+    df_cache = None
+    predictions_cache = None
+    regimes_cache = {}
+    
     while True:
-        df = await fetch_candles(figi, days=90)
-        current_market_price = await get_current_price()
         current_time = datetime.now()
-
+        current_market_price = await get_current_price()
+        
         if current_market_price is not None:
             prediction_tracker.update_actuals(current_time, current_market_price)
-
-        if df.empty:
-            print("Нет данных свечей для данного тикера")
-        else:
+        
+        # Обновляем полную модель только с определенной периодичностью
+        need_model_update = (current_time - last_update_time) > model_update_interval
+        
+        if need_model_update or df_cache is None:
+            print("Обновление модели и данных...")
+            df = await fetch_candles(figi, days=90)
+            last_update_time = current_time
+            
+            if df.empty:
+                print("Нет данных свечей для данного тикера")
+                await asyncio.sleep(30)  # Увеличиваем паузу при ошибке
+                continue
+                
             df = preprocess_data(df)
             df = calculate_indicators(df)
-
+            
             time_intervals = [1, 5, 15, 30]
             predictions = predict_multiple_steps_enhanced(df, lags=3)
-
+            
+            # Сохраняем кэш
+            df_cache = df
+            predictions_cache = predictions
+            
+            # Обновляем режимы рынка и добавляем прогнозы только при полном обновлении
+            regimes_cache = detect_regime(df)
             prediction_tracker.add_predictions(current_time, predictions, time_intervals)
 
-            accuracy_stats = prediction_tracker.get_accuracy_stats()
-
-            last_close = df["close_clean"].iloc[-1]
-            raw_close = current_market_price if current_market_price else df["last_raw_close"]
-            regimes = detect_regime(df)
-            indicators = {
-                "ema20": df["ema20"].iloc[-1],
-                "sma20": df["sma20"].iloc[-1],
-                "rsi": df["rsi"].iloc[-1],
-                "macd": df["macd"].iloc[-1],
-                "macd_signal": df["macd_signal"].iloc[-1],
-                "bb_upper": df["bb_upper"].iloc[-1],
-                "bb_lower": df["bb_lower"].iloc[-1],
-                "stoch": df["stoch"].iloc[-1],
-                "ema50": df["ema50"].iloc[-1],
-                "vol_ma20": df["vol_ma20"].iloc[-1],
-                "volume": df["volume"].iloc[-1]
-            }
-            analysis = analyze_market(indicators, raw_close, predictions, df)
-            clear_terminal()
-            print_report(ticker, figi, last_close, raw_close, predictions, current_time,
-                         indicators, regimes, analysis, accuracy_stats)
-        await asyncio.sleep(10)
+        # Используем кэшированные данные
+        last_close = df_cache["close_clean"].iloc[-1]
+        raw_close = current_market_price if current_market_price else df_cache["last_raw_close"]
+        
+        indicators = {
+            "ema20": df_cache["ema20"].iloc[-1],
+            "sma20": df_cache["sma20"].iloc[-1],
+            "rsi": df_cache["rsi"].iloc[-1],
+            "macd": df_cache["macd"].iloc[-1],
+            "macd_signal": df_cache["macd_signal"].iloc[-1],
+            "bb_upper": df_cache["bb_upper"].iloc[-1],
+            "bb_lower": df_cache["bb_lower"].iloc[-1],
+            "stoch": df_cache["stoch"].iloc[-1],
+            "ema50": df_cache["ema50"].iloc[-1],
+            "vol_ma20": df_cache["vol_ma20"].iloc[-1],
+            "volume": df_cache["volume"].iloc[-1]
+        }
+        
+        analysis = analyze_market(indicators, raw_close, predictions_cache, df_cache)
+        accuracy_stats = prediction_tracker.get_accuracy_stats()
+        
+        # Рассчитываем метрики риска
+        risk_metrics = calculate_risk_metrics(df_cache, raw_close, predictions_cache)
+        
+        clear_terminal()
+        print_report(ticker, figi, last_close, raw_close, predictions_cache, current_time,
+                    indicators, regimes_cache, analysis, accuracy_stats, risk_metrics)
+                    
+        await asyncio.sleep(data_update_interval.total_seconds())
 
 
 if __name__ == "__main__":
