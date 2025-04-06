@@ -105,10 +105,8 @@ async def fetch_candles(figi: str, days: int = 90):
 
             minute_to_hour['timeframe'] = 'hour_from_minute'
 
-            # Объединяем с часовыми данными
             all_candles = pd.concat([df_hour, minute_to_hour])
         else:
-            # Просто объединяем данные
             all_candles = pd.concat([df_hour, df_minute])
     elif not df_hour.empty:
         all_candles = df_hour
@@ -122,7 +120,6 @@ async def fetch_candles(figi: str, days: int = 90):
         all_candles.sort_values('time', inplace=True)
         all_candles.set_index('time', inplace=True)
 
-        # Сохраняем информацию о последней рыночной цене
         all_candles["last_raw_close"] = all_candles["close"].iloc[
             -1] if not all_candles.empty else None
 
@@ -190,14 +187,13 @@ def preprocess_data(df: pd.DataFrame):
             "Предупреждение: Недостаточно данных для надежной обработки выбросов"
         )
         df["close_clean"] = df[
-            "close_smooth"]  # Без обработки выбросов при малом количестве данных
+            "close_smooth"]
     else:
         roll_med = df["close_smooth"].rolling(
             window=window_size, min_periods=min_periods).median()
         roll_std = df["close_smooth"].rolling(
             window=window_size, min_periods=min_periods).std().fillna(0)
 
-        # Определяем выбросы с адаптивным порогом
         diff = np.abs(df["close_smooth"] - roll_med)
         threshold_factor = 3.0 if len(df) > 30 else 4.0
         threshold = threshold_factor * roll_std
@@ -205,12 +201,10 @@ def preprocess_data(df: pd.DataFrame):
         df["close_clean"] = np.where(diff > threshold, roll_med,
                                      df["close_smooth"])
 
-    # Последний час всегда оставляем как есть, поскольку это текущие рыночные данные
     last_hour_mask = df.index >= (df.index.max() - pd.Timedelta(hours=1))
     if any(last_hour_mask):
         df.loc[last_hour_mask, "close_clean"] = df.loc[last_hour_mask, "close"]
 
-    # Заполняем возможные NaN после всех операций
     df["close_clean"] = df["close_clean"].fillna(df["close"])
 
     return df
@@ -290,19 +284,16 @@ def create_features(df: pd.DataFrame, lags: int = 3):
 
 
 def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
-    # Импортируем StandardScaler в начале функции
     from sklearn.preprocessing import StandardScaler
 
     if len(df) < 30:
         print(
             "Предупреждение: Недостаточно данных для надежного обучения модели."
         )
-        # Возвращаем простую наивную модель вместо сложной
         from sklearn.dummy import DummyRegressor
         dummy_model = DummyRegressor(strategy="mean")
         dummy_model.fit(np.array([[0]]), np.array([df["close_clean"].mean()]))
 
-        # Создаем пустые масштабировщики
         scaler_X = StandardScaler()
         scaler_X.fit(np.array([[0]]))
         scaler_y = StandardScaler()
@@ -312,38 +303,31 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
 
     df_feat, feature_cols = create_features(df.copy(), lags)
 
-    # Проверка стационарности временного ряда
     from statsmodels.tsa.stattools import adfuller
 
-    # Проверяем ряд цен на стационарность
     adf_result = adfuller(df_feat['close_clean'].dropna())
 
     if adf_result[1] > 0.05:
         print(
             f"Предупреждение: Ряд цен нестационарен (p-value: {adf_result[1]:.4f}). Рассмотрите использование разностей."
         )
-        # Создаем признак разности цен для улучшения стационарности
         df_feat['price_diff'] = df_feat['close_clean'].diff().fillna(0)
         if 'price_diff' not in feature_cols:
             feature_cols.append('price_diff')
     else:
         print(f"Временной ряд стационарен (p-value: {adf_result[1]:.4f})")
 
-    # Правильное разделение на обучающую и тестовую выборки для временных рядов
-    # Используем строго последовательный подход - последние 20% данных для тестирования
     test_size = int(len(df_feat) * 0.2)
     train_df = df_feat.iloc[:-test_size] if test_size > 0 else df_feat.copy()
     test_df = df_feat.iloc[-test_size:] if test_size > 0 else pd.DataFrame()
 
-    # Создаем кросс-валидацию внутри тренировочного набора
     from sklearn.model_selection import TimeSeriesSplit
     tscv = TimeSeriesSplit(
-        n_splits=3)  # Уменьшено для более стабильных результатов
+        n_splits=3) 
 
     X_train = train_df[feature_cols].values
     y_train = train_df['close_clean'].values.reshape(-1, 1)
 
-    # Удаление выбросов только из тренировочного набора
     lower_bounds = {}
     upper_bounds = {}
     for i in range(X_train.shape[1]):
@@ -354,26 +338,21 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
         upper_bounds[i] = q3 + 1.5 * iqr
         X_train[:, i] = np.clip(col_data, lower_bounds[i], upper_bounds[i])
 
-    # Масштабируем данные после удаления выбросов
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     X_train_scaled = scaler_X.fit_transform(X_train)
     y_train_scaled = scaler_y.fit_transform(y_train).ravel()
 
-    # Оцениваем различные типы моделей для выбора наилучшей
     from sklearn.linear_model import Ridge, ElasticNet
     from sklearn.ensemble import GradientBoostingRegressor
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-    # Тестируем несколько типов моделей, адаптируем сложность к размеру данных
     if len(X_train) < 50:
-        # Для маленьких выборок используем более простые модели
         models = {
             'ridge': Ridge(),
             'elasticnet': ElasticNet(random_state=42, alpha=1.0)
         }
     else:
-        # Для больших выборок можем позволить более сложные модели
         models = {
             'ridge':
             Ridge(),
@@ -390,7 +369,6 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
     best_params = None
     best_score = -float('inf')
 
-    # Простая оптимизация гиперпараметров
     for model_name, model in models.items():
         if model_name == 'ridge':
             param_grid = {'alpha': [0.01, 0.1, 1.0, 10.0]}
@@ -405,7 +383,6 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
         best_param_score = -float('inf')
         best_model_params = None
 
-        # Перебор параметров
         import itertools
         param_combinations = list(itertools.product(*param_grid.values()))
         param_names = list(param_grid.keys())
@@ -434,13 +411,11 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
                 best_param_score = mean_score
                 best_model_params = param_dict
 
-        # Если эта модель лучше предыдущих, сохраняем её
         if best_param_score > best_score:
             best_score = best_param_score
             best_model_name = model_name
             best_params = best_model_params
 
-    # Создаем и обучаем лучшую модель
     if best_model_name == 'ridge':
         best_model = Ridge(**best_params)
     elif best_model_name == 'elasticnet':
@@ -455,44 +430,37 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
         f"Выбрана модель: {best_model_name} с параметрами: {best_params}, средний R²: {best_score:.4f}"
     )
 
-    # Обучаем окончательную модель на всех тренировочных данных
     best_model.fit(X_train_scaled, y_train_scaled)
 
-    # Проверка на тестовых данных
     if len(test_df) > 0:
         X_test = test_df[feature_cols].values
         y_test = test_df['close_clean'].values
 
-        # Применяем те же ограничения к тестовым данным, чтобы избежать утечки
         for i in range(X_test.shape[1]):
-            if i in lower_bounds:  # Проверка на случай изменения признаков
+            if i in lower_bounds:
                 X_test[:, i] = np.clip(X_test[:, i], lower_bounds[i],
                                        upper_bounds[i])
 
         X_test_scaled = scaler_X.transform(X_test)
 
-        # Получаем предсказания
         pred_test_scaled = best_model.predict(X_test_scaled)
         pred_test = scaler_y.inverse_transform(pred_test_scaled.reshape(
             -1, 1)).ravel()
 
-        # Оцениваем качество модели
         mae = mean_absolute_error(y_test, pred_test)
         rmse = np.sqrt(mean_squared_error(y_test, pred_test))
         r2 = r2_score(y_test, pred_test)
 
-        # Вычисляем точность направления
         direction_pred = np.sign(np.diff(np.append([y_test[0]], pred_test)))
         direction_actual = np.sign(np.diff(y_test))
         direction_accuracy = np.mean(direction_pred[:-1] == direction_actual
-                                     ) * 100  # последний элемент отбрасываем
+                                     ) * 100 
 
         print(
             f"Тестирование модели: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}"
         )
         print(f"Точность направления движения: {direction_accuracy:.2f}%")
 
-        # Наивная модель для сравнения (предыдущее значение)
         naive_pred = np.roll(y_test, 1)
         naive_pred[0] = y_test[0]
         naive_mae = mean_absolute_error(y_test[1:], naive_pred[1:])
@@ -500,7 +468,6 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
 
         print(f"Наивная модель: MAE={naive_mae:.4f}, RMSE={naive_rmse:.4f}")
 
-        # Сравнение с наивной моделью
         if rmse >= naive_rmse:
             print(
                 "Предупреждение: Модель не превосходит наивный прогноз. Требуется улучшение."
@@ -516,51 +483,40 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
 def predict_multiple_steps_enhanced(df: pd.DataFrame,
                                     steps: int = 5,
                                     lags: int = 3):
-    """
-    Упрощенная версия функции без предсказания цен.
-    Возвращает текущую цену для всех временных шагов.
-    """
+
     if df.empty:
         return [0] * steps
     
     current_price = df['close_clean'].iloc[-1]
-    # Просто возвращаем текущую цену для всех интервалов без вариаций
     return [current_price] * steps
 
 
 def detect_regime(df: pd.DataFrame):
     try:
-        if len(df) < 30:  # Проверка наличия достаточного количества данных
+        if len(df) < 30:
             print("Недостаточно данных для определения режима рынка")
             return {}
 
-        # Вместо использования только цены закрытия, используем процентное изменение цен
-        # Это лучше для определения режима, поскольку сосредотачивается на изменениях, а не на абсолютных значениях
         returns = df["close_clean"].pct_change().dropna()
         
         if len(returns) < 20:
             print("Недостаточно точек данных для надежного определения режима")
             return {}
             
-        # Удаление выбросов для стабильности модели
         lower_q, upper_q = returns.quantile([0.01, 0.99])
         filtered_returns = returns[(returns >= lower_q) & (returns <= upper_q)]
         
-        # Если после фильтрации осталось мало данных, используем оригинальные
         if len(filtered_returns) < 20:
             filtered_returns = returns
             
-        # Дополнительные признаки для определения режима (опционально)
         extra_features = None
-        if len(df) > 40:  # Если достаточно данных, добавляем дополнительные признаки
+        if len(df) > 40:
             try:
-                # Создаем признаки, отражающие рыночные условия
                 rsi = df['rsi'].dropna()
                 macd_diff = (df['macd'] - df['macd_signal']).dropna()
                 
-                # Важно убедиться, что длины всех рядов совпадают
                 min_length = min(len(filtered_returns), len(rsi), len(macd_diff))
-                if min_length >= 20:  # Проверяем, что все еще достаточно данных
+                if min_length >= 20:
                     extra_features = pd.DataFrame({
                         'returns': filtered_returns.iloc[-min_length:].values,
                         'rsi': rsi.iloc[-min_length:].values,
@@ -568,29 +524,23 @@ def detect_regime(df: pd.DataFrame):
                     })
             except Exception as e:
                 print(f"Ошибка при подготовке дополнительных признаков: {e}")
-                # В случае ошибки используем только возвраты
                 extra_features = None
         
-        # Выбираем входные данные для модели
         model_input = extra_features['returns'] if extra_features is not None else filtered_returns
         
-        # Настройка модели для большей стабильности
         mr = MarkovRegression(model_input,
                               k_regimes=2,
                               trend='c',
                               switching_variance=True,
-                              switching_trend=True)  # Добавляем переключение тренда
+                              switching_trend=True)
         
-        # Пытаемся подобрать несколько стартовых параметров для лучшей сходимости
         best_result = None
         best_aic = float('inf')
         
-        # Проверяем несколько начальных состояний
         for attempt in range(3):
             try:
                 res = mr.fit(disp=False, maxiter=100)
                 
-                # Выбираем лучшую модель по информационному критерию
                 if hasattr(res, 'aic') and res.aic < best_aic:
                     best_aic = res.aic
                     best_result = res
@@ -598,7 +548,6 @@ def detect_regime(df: pd.DataFrame):
                 print(f"Попытка {attempt+1} подобрать модель не удалась: {e}")
         
         if best_result is None:
-            # Если все попытки не удались, пробуем упрощенную модель
             try:
                 mr_simple = MarkovRegression(model_input,
                                            k_regimes=2,
@@ -609,17 +558,13 @@ def detect_regime(df: pd.DataFrame):
                 print(f"Не удалось построить даже упрощенную модель: {e}")
                 return {}
         
-        # Получаем вероятности режимов
         regimes = best_result.smoothed_marginal_probabilities.iloc[-1].to_dict()
         
-        # Определяем, какой режим соответствует бычьему/медвежьему рынку
-        # Для этого анализируем средние возвраты в каждом режиме
         try:
             regime_states = best_result.smoothed_marginal_probabilities.idxmax(axis=1)
             regime_0_mean = model_input[regime_states == 0].mean()
             regime_1_mean = model_input[regime_states == 1].mean()
             
-            # Если нужно поменять режимы местами (чтобы режим 0 был бычьим)
             if regime_0_mean < regime_1_mean:
                 regimes_swapped = {"0": regimes["1"], "1": regimes["0"]}
                 return regimes_swapped
@@ -639,9 +584,7 @@ def analyze_market(ind, current_price, predictions, df=None):
     reason_bull = []
     reason_bear = []
 
-    # Проверка наличия экстремальных рыночных условий
     try:
-        # Проверка повышенной волатильности
         if df is not None and len(df) > 20:
             recent_volatility = df['close_clean'].pct_change().rolling(
                 window=5).std().iloc[-1]
@@ -649,64 +592,60 @@ def analyze_market(ind, current_price, predictions, df=None):
                 window=20).std().iloc[-1]
 
             if recent_volatility > historical_volatility * 2:
-                score_bear += 3  # Увеличен вес
+                score_bear += 3 
                 reason_bear.append(
                     f"Экстремальная волатильность (x{recent_volatility/historical_volatility:.1f})"
                 )
 
-        # Проверка на гэпы в цене (если данные обновлялись после закрытия и открытия рынка)
         if df is not None and len(df) > 1:
             last_close = df['close_clean'].iloc[-2]
             current_open = df['open'].iloc[-1]
             if abs(current_open -
-                   last_close) / last_close > 0.02:  # гэп более 2%
+                   last_close) / last_close > 0.02: 
                 gap_direction = "верх" if current_open > last_close else "вниз"
                 gap_size = abs(current_open - last_close) / last_close * 100
                 if gap_direction == "верх":
-                    score_bull += 3  # Увеличен вес
+                    score_bull += 3  
                     reason_bull.append(f"Гэп вверх {gap_size:.1f}%")
                 else:
-                    score_bear += 3  # Увеличен вес
+                    score_bear += 3 
                     reason_bear.append(f"Гэп вниз {gap_size:.1f}%")
     except Exception as e:
         print(f"Предупреждение: ошибка при анализе рыночных условий: {e}")
 
-    # Анализ RSI с увеличенным весом
     if ind["rsi"] < 30:
-        score_bull += 3  # Усилен сигнал
+        score_bull += 3 
         reason_bull.append("RSI перепродан (<30)")
     elif ind["rsi"] < 40:
-        score_bull += 2  # Усилен сигнал
+        score_bull += 2 
         reason_bull.append("RSI приближается к перепроданности (<40)")
     elif ind["rsi"] > 70:
-        score_bear += 3  # Усилен сигнал
+        score_bear += 3 
         reason_bear.append("RSI перекуплен (>70)")
     elif ind["rsi"] > 60:
-        score_bear += 2  # Усилен сигнал
+        score_bear += 2
         reason_bear.append("RSI приближается к перекупленности (>60)")
 
-    # Анализ MACD с уточненными значениями
     macd_diff = ind["macd"] - ind["macd_signal"]
     if macd_diff > 0:
-        if macd_diff > 1:  # Уменьшен порог сильного сигнала для более точной градации
+        if macd_diff > 1: 
             score_bull += 3
             reason_bull.append("Сильный бычий сигнал MACD")
         else:
             score_bull += 2
             reason_bull.append("Бычий сигнал MACD")
     elif macd_diff < 0:
-        if macd_diff < -1:  # Уменьшен порог сильного сигнала для более точной градации
+        if macd_diff < -1: 
             score_bear += 3
             reason_bear.append("Сильный медвежий сигнал MACD")
         else:
             score_bear += 2
             reason_bear.append("Медвежий сигнал MACD")
 
-    # Анализ Bollinger Bands с более точной градацией
     bb_percent = (current_price - ind["bb_lower"]) / (ind["bb_upper"] -
                                                       ind["bb_lower"]) * 100
     if bb_percent < 10:
-        score_bull += 3  # Очень сильный сигнал
+        score_bull += 3
         reason_bull.append(
             f"Цена очень близка к нижней границе BB ({bb_percent:.1f}%)")
     elif bb_percent < 20:
@@ -714,7 +653,7 @@ def analyze_market(ind, current_price, predictions, df=None):
         reason_bull.append(
             f"Цена близка к нижней границе BB ({bb_percent:.1f}%)")
     elif bb_percent > 90:
-        score_bear += 3  # Очень сильный сигнал
+        score_bear += 3  
         reason_bear.append(
             f"Цена очень близка к верхней границе BB ({bb_percent:.1f}%)")
     elif bb_percent > 80:
@@ -722,16 +661,14 @@ def analyze_market(ind, current_price, predictions, df=None):
         reason_bear.append(
             f"Цена близка к верхней границе BB ({bb_percent:.1f}%)")
 
-    # Анализ EMA с учетом текущей цены
     if current_price > ind["ema50"] and current_price > ind["ema20"] and ind[
             "ema20"] > ind["ema50"]:
-        score_bull += 3  # Увеличен вес
+        score_bull += 3  
         reason_bull.append("Восходящий тренд по EMA (цена > EMA20 > EMA50)")
     elif current_price < ind["ema50"] and current_price < ind["ema20"] and ind[
             "ema20"] < ind["ema50"]:
-        score_bear += 3  # Увеличен вес
+        score_bear += 3  
         reason_bear.append("Нисходящий тренд по EMA (цена < EMA20 < EMA50)")
-    # Добавлены промежуточные ситуации
     elif current_price > ind["ema20"] and ind["ema20"] < ind["ema50"]:
         score_bull += 1
         reason_bull.append("Возможный разворот тренда вверх (цена > EMA20)")
@@ -739,15 +676,13 @@ def analyze_market(ind, current_price, predictions, df=None):
         score_bear += 1
         reason_bear.append("Возможный разворот тренда вниз (цена < EMA20)")
 
-    # Анализ стохастик
     if ind["stoch"] < 20:
-        score_bull += 2  # Увеличен вес
+        score_bull += 2  
         reason_bull.append("Стохастик перепродан (<20)")
     elif ind["stoch"] > 80:
-        score_bear += 2  # Увеличен вес
+        score_bear += 2 
         reason_bear.append("Стохастик перекуплен (>80)")
 
-    # Анализ объемов с большей детализацией
     if df is not None and len(df) > 5:
         last_volume = df['volume'].iloc[-1]
         avg_volume = df['vol_ma20'].iloc[-1]
@@ -759,10 +694,10 @@ def analyze_market(ind, current_price, predictions, df=None):
             price_direction = 1 if last_close > prev_close else -1
 
             if price_direction > 0:
-                score_bull += 4  # Увеличен вес
+                score_bull += 4 
                 reason_bull.append(f"Крупная сделка на покупку (объем x{volume_ratio:.1f})")
             else:
-                score_bear += 4  # Увеличен вес
+                score_bear += 4 
                 reason_bear.append(f"Крупная сделка на продажу (объем x{volume_ratio:.1f})")
         elif volume_ratio > 2.0:
             last_close = df['close_clean'].iloc[-1]
@@ -770,34 +705,32 @@ def analyze_market(ind, current_price, predictions, df=None):
             price_direction = 1 if last_close > prev_close else -1
 
             if price_direction > 0:
-                score_bull += 3  # Увеличен вес
+                score_bull += 3  
                 reason_bull.append(f"Повышенные покупки (объем x{volume_ratio:.1f})")
             else:
-                score_bear += 3  # Увеличен вес
+                score_bear += 3 
                 reason_bear.append(f"Повышенные продажи (объем x{volume_ratio:.1f})")
 
-        # Анализ тренда объема
         if len(df) > 10:
             volume_trend = df['volume'].iloc[-5:].mean() - df['volume'].iloc[-10:-5].mean()
             if volume_trend > 0:
                 price_trend = df['close_clean'].iloc[-5:].mean() - df['close_clean'].iloc[-10:-5].mean()
                 if price_trend > 0:
-                    score_bull += 2  # Увеличен вес
+                    score_bull += 2 
                     reason_bull.append("Растущий объем при росте цены")
                 else:
-                    score_bear += 2  # Увеличен вес
+                    score_bear += 2 
                     reason_bear.append("Растущий объем при падении цены")
             else:
                 price_trend = df['close_clean'].iloc[-5:].mean() - df['close_clean'].iloc[-10:-5].mean()
                 if abs(price_trend) > 0 and volume_trend < -avg_volume * 0.2:
                     if price_trend > 0:
-                        score_bear += 2  # Увеличен вес
+                        score_bear += 2
                         reason_bear.append("Падающий объем при росте цены (слабость)")
                     else:
-                        score_bull += 2  # Увеличен вес
+                        score_bull += 2 
                         reason_bull.append("Падающий объем при снижении цены (слабость)")
 
-        # Анализ серии крупных сделок
         if len(df) > 20:
             large_buys = 0
             large_sells = 0
@@ -813,54 +746,45 @@ def analyze_market(ind, current_price, predictions, df=None):
                         large_sells += 1
 
             if large_buys >= 3:
-                score_bull += 3  # Увеличен вес
+                score_bull += 3  
                 reason_bull.append(f"Серия крупных покупок ({large_buys})")
             if large_sells >= 3:
-                score_bear += 3  # Увеличен вес
+                score_bear += 3 
                 reason_bear.append(f"Серия крупных продаж ({large_sells})")
 
-    # Анализ режимов рынка из данных MarkovRegression
     if df is not None:
-        # Получаем режим рынка
         regimes = detect_regime(df)
         if regimes:
-            # Режим 1 обычно соответствует медвежьему тренду
             bearish_probability = regimes.get("1", 0)
-            # Режим 0 обычно соответствует бычьему тренду
             bullish_probability = regimes.get("0", 0)
             
-            # Если вероятность медвежьего режима высокая (>70%)
             if bearish_probability > 0.7:
                 score_bear += 3
                 reason_bear.append(f"Медвежий режим рынка ({bearish_probability*100:.0f}%)")
-            # Если вероятность бычьего режима высокая (>70%)
             elif bullish_probability > 0.7:
                 score_bull += 3
                 reason_bull.append(f"Бычий режим рынка ({bullish_probability*100:.0f}%)")
 
-    # Расчет силы быков с учетом всех факторов
     bull_strength = score_bull / (score_bull + score_bear) * 100 if (
         score_bull + score_bear) > 0 else 50
     reasons = []
 
-    # Определение сигнала
-    if bull_strength >= 70:  # Повышен порог для более четких сигналов
+    if bull_strength >= 70:
         signal = "СИГНАЛ к ЛОНГУ"
         reasons = reason_bull
-    elif bull_strength <= 30:  # Понижен порог для более четких сигналов
+    elif bull_strength <= 30: 
         signal = "СИГНАЛ к ШОРТУ"
         reasons = reason_bear
-    elif bull_strength >= 55:  # Добавлен промежуточный сигнал
+    elif bull_strength >= 55: 
         signal = "РЫНОК НЕЙТРАЛЕН с бычьим уклоном"
         reasons = reason_bull
-    elif bull_strength <= 45:  # Добавлен промежуточный сигнал
+    elif bull_strength <= 45: 
         signal = "РЫНОК НЕЙТРАЛЕН с медвежьим уклоном"
         reasons = reason_bear
     else:
         signal = "РЫНОК НЕЙТРАЛЕН"
         reasons = reason_bull + reason_bear
 
-    # Сортировка причин по значимости и ограничение количества
     reasons = sorted(reasons, key=lambda x: len(x), reverse=True)[:3]
     reason_text = ", ".join(reasons) if reasons else "Нет явных сигналов"
     
@@ -1052,18 +976,16 @@ def clear_terminal():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def show_loading_animation(message="Загрузка данных"):
-    """Показывает анимацию загрузки с использованием tqdm"""
     from tqdm import tqdm
     import time
     
     clear_terminal()
     print(f"\033[1;36m{message}...\033[0m")
     for _ in tqdm(range(100), desc="Прогресс", ncols=80, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}"):
-        time.sleep(0.01)  # Имитация работы
+        time.sleep(0.01) 
 
 
 def calculate_risk_metrics(df, current_price, predictions):
-    # Расчет простого Value at Risk (VaR) на основе исторической волатильности
     if df is None or len(df) < 30:
         return {"var_95": 0, "max_loss_pct": 0, "risk_level": "Неизвестно"}
 
@@ -1075,16 +997,13 @@ def calculate_risk_metrics(df, current_price, predictions):
             "risk_level": "Недостаточно данных"
         }
 
-    # Расчет 95% VaR (потенциальная потеря с 95% уверенностью)
     var_95 = abs(returns.quantile(0.05) * current_price)
     var_95_pct = abs(returns.quantile(0.05) * 100)
 
-    # Максимальная историческая просадка за последние 30 дней
     rolling_max = df['close_clean'].rolling(window=30).max()
     daily_drawdown = df['close_clean'] / rolling_max - 1.0
     max_loss_pct = abs(daily_drawdown.min() * 100)
 
-    # Определение уровня риска
     if var_95_pct > 5:
         risk_level = "Высокий"
     elif var_95_pct > 2:
@@ -1105,7 +1024,6 @@ from termcolor import colored
 import asciichartpy as ascii_chart
 import numpy as np
 
-# Initialize colorama for Windows support
 init()
 
 def generate_ascii_chart(prices, width=40, height=10):
@@ -1126,7 +1044,6 @@ def print_report(ticker,
                  accuracy_stats=None,
                  risk_metrics=None,
                  df=None):
-    # Цветовое кодирование
     GREEN = Fore.GREEN + Style.BRIGHT
     RED = Fore.RED + Style.BRIGHT
     YELLOW = Fore.YELLOW + Style.BRIGHT
@@ -1136,13 +1053,11 @@ def print_report(ticker,
     WHITE = Fore.WHITE + Style.BRIGHT
     RESET = Style.RESET_ALL
     
-    # Генерируем историю если достаточно данных
     historical_chart = ""
     if df is not None and len(df) > 20:
         historical_values = df['close_clean'].iloc[-20:].tolist()
         historical_chart = generate_ascii_chart(historical_values, width=50, height=10)
     
-    # Режимы рынка
     if regimes:
         regime_items = []
         for k, v in regimes.items():
@@ -1153,7 +1068,6 @@ def print_report(ticker,
     else:
         regime_str = f"{YELLOW}Нет данных о режимах{RESET}"
 
-    # Объемы торгов
     vol_info = ""
     if 'volume' in indicators and 'vol_ma20' in indicators:
         last_vol = indicators.get('volume', 0)
@@ -1178,18 +1092,15 @@ def print_report(ticker,
 
         vol_info = f"{CYAN}Объем:{RESET} {vol_color}{last_vol} ({vol_ratio:.2f}x) {vol_symbol}{RESET}"
 
-    # Форматирование индикаторов
     rsi_color = GREEN if indicators['rsi'] < 30 else RED if indicators['rsi'] > 70 else WHITE
     macd_color = GREEN if indicators['macd'] > indicators['macd_signal'] else RED
     bb_position = (raw_close - indicators['bb_lower']) / (indicators['bb_upper'] - indicators['bb_lower']) * 100
     bb_color = RED if bb_position > 80 else GREEN if bb_position < 20 else WHITE
     
-    # Создаем визуальное представление для RSI
     rsi_bars = "▁▂▃▄▅▆▇█"
     rsi_index = min(int(indicators['rsi'] / 12.5), 7)
     rsi_visual = rsi_bars[rsi_index]
     
-    # Упрощенная визуализация индикаторов
     indicators_display = [
         f"{CYAN}RSI:{RESET} {rsi_color}{indicators['rsi']:.1f} {rsi_visual}{RESET}",
         f"{CYAN}MACD:{RESET} {macd_color}{indicators['macd']:.2f}/{indicators['macd_signal']:.2f}{RESET}",
@@ -1198,7 +1109,6 @@ def print_report(ticker,
         vol_info
     ]
     
-    # Более подробные индикаторы можно скрыть в дополнительном разделе
     detailed_indicators = (
         f"  EMA20: {indicators['ema20']:.2f} | SMA20: {indicators['sma20']:.2f} | RSI: {indicators['rsi']:.2f}\n"
         f"  MACD: {indicators['macd']:.2f} | MACD Signal: {indicators['macd_signal']:.2f}\n"
@@ -1206,7 +1116,6 @@ def print_report(ticker,
         f"  Stoch: {indicators['stoch']:.2f} | EMA50: {indicators['ema50']:.2f} | Vol_MA20: {indicators['vol_ma20']:.2f}"
     )
 
-    # Информация о риске
     risk_info = ""
     if risk_metrics:
         if risk_metrics["risk_level"] == "Высокий":
@@ -1222,7 +1131,6 @@ def print_report(ticker,
             risk_color = WHITE
             risk_symbol = "•"
 
-        # Создаем визуальный индикатор риска
         var_pct = risk_metrics.get('var_95_pct', 0)
         var_bars = "▁▂▃▄▅▆▇█"
         var_index = min(int(var_pct / 1.25), 7)  # до 10% риска
@@ -1236,10 +1144,8 @@ def print_report(ticker,
             f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}"
         )
 
-    # Разделитель подсекций
     section_divider = f"{CYAN}─────────────────────────────────────────────────────────────{RESET}"
     
-    # Оформляем анализ рынка
     signal_part = ""
     reason_part = ""
     
@@ -1254,7 +1160,6 @@ def print_report(ticker,
         bull_strength = float(analysis.split("(")[1].split("%")[0])
         strength_color = GREEN if bull_strength > 65 else RED if bull_strength < 35 else YELLOW
         
-        # Визуализация бычьей силы
         strength_bars = "▁▂▃▄▅▆▇█"
         strength_index = min(int(bull_strength / 12.5), 7)
         strength_visual = strength_bars[strength_index]
@@ -1266,7 +1171,6 @@ def print_report(ticker,
     
     analysis_formatted = f"{signal_part} ({strength_part}) - {reason_part}"
     
-    # Формируем основной отчет
     header = (
         f"\n{MAGENTA}{'='*70}{RESET}\n"
         f"{MAGENTA}║{RESET} {WHITE}{ticker.upper()} - Торговый анализ{RESET}{' '*40}{MAGENTA}║{RESET}\n"
@@ -1302,7 +1206,6 @@ def print_report(ticker,
         f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}"
     )
     
-    # Исторический график (если доступен)
     history_section = ""
     if historical_chart:
         history_section = (
@@ -1311,7 +1214,6 @@ def print_report(ticker,
             f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}"
         )
     
-    # Собираем все вместе
     report = (
         f"{header}\n"
         f"{timestamp}\n\n"
@@ -1335,16 +1237,16 @@ async def main():
         return
 
     last_update_time = datetime.now() - timedelta(
-        minutes=10)  # Инициализация для первого обновления
+        minutes=10) 
     model_update_interval = timedelta(
-        minutes=30)  # Обновляем модель каждые 30 минут
+        minutes=30)  
     data_update_interval = timedelta(
-        seconds=10)  # Обновляем данные каждые 10 секунд
+        seconds=10) 
 
     async def get_current_price():
         retry_count = 0
         max_retries = 3
-        retry_delay = 2  # секунды
+        retry_delay = 2  
 
         while retry_count < max_retries:
             try:
@@ -1370,10 +1272,9 @@ async def main():
             if retry_count < max_retries:
                 print(f"Повторная попытка через {retry_delay} сек...")
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Увеличиваем задержку при каждой повторной попытке
+                retry_delay *= 2 
 
         print("Не удалось получить текущую цену после нескольких попыток")
-        # Возвращаем кешированное значение, если оно есть
         if df_cache is not None and "last_raw_close" in df_cache:
             print(
                 f"Используем последнюю известную цену: {df_cache['last_raw_close']}"
@@ -1381,7 +1282,6 @@ async def main():
             return df_cache["last_raw_close"]
         return None
 
-    # Кэшируем последние данные
     df_cache = None
     predictions_cache = None
     regimes_cache = {}
@@ -1390,7 +1290,6 @@ async def main():
         current_time = datetime.now()
         current_market_price = await get_current_price()
 
-        # Обновляем полную модель только с определенной периодичностью
         need_model_update = (current_time -
                              last_update_time) > model_update_interval
 
@@ -1401,23 +1300,19 @@ async def main():
 
             if df.empty:
                 print("Нет данных свечей для данного тикера")
-                await asyncio.sleep(30)  # Увеличиваем паузу при ошибке
+                await asyncio.sleep(30) 
                 continue
 
             df = preprocess_data(df)
             df = calculate_indicators(df)
 
-            # Получаем базовый прогноз цен (без предсказаний)
             predictions = predict_multiple_steps_enhanced(df, lags=3)
 
-            # Сохраняем кэш
             df_cache = df
             predictions_cache = predictions
 
-            # Обновляем режимы рынка
             regimes_cache = detect_regime(df)
 
-        # Используем кэшированные данные
         last_close = df_cache["close_clean"].iloc[-1]
         raw_close = current_market_price if current_market_price else df_cache[
             "last_raw_close"]
@@ -1439,7 +1334,6 @@ async def main():
         analysis = analyze_market(indicators, raw_close, predictions_cache,
                                   df_cache)
 
-        # Рассчитываем метрики риска
         risk_metrics = calculate_risk_metrics(df_cache, raw_close,
                                               predictions_cache)
 
