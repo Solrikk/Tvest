@@ -3,10 +3,11 @@ import asyncio
 import pandas as pd
 import numpy as np
 import pickle
-import json
 import itertools
 import time
+import logging
 from datetime import timedelta, datetime
+from typing import Any, Dict, List, Tuple
 from tinkoff.invest import CandleInterval, AsyncClient, Client
 from tinkoff.invest.utils import now, quotation_to_decimal
 from sklearn.linear_model import Ridge, ElasticNet
@@ -21,124 +22,132 @@ from colorama import init, Fore, Style
 import asciichartpy as ascii_chart
 from tqdm import tqdm
 
-init()
+init(autoreset=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-TOKEN = os.environ.get("TINKOFF_TOKEN")
+TOKEN: str = os.environ.get("TINKOFF_TOKEN")
 if not TOKEN:
     import getpass
     TOKEN = getpass.getpass("Введите ваш Tinkoff API токен: ")
 
 def get_figi_by_ticker(ticker: str) -> str:
-    with Client(TOKEN) as client:
-        instruments = []
-        for method in ["shares", "bonds", "etfs", "currencies", "futures"]:
-            instruments += getattr(client.instruments, method)().instruments
-        filtered = [inst for inst in instruments if inst.ticker.upper() == ticker.upper()]
-        if filtered:
-            return filtered[0].figi
-        else:
-            raise ValueError("Инструмент не найден")
+    try:
+        with Client(TOKEN) as client:
+            instruments = []
+            for method in ["shares", "bonds", "etfs", "currencies", "futures"]:
+                instruments += getattr(client.instruments, method)().instruments
+            filtered = [inst for inst in instruments if inst.ticker.upper() == ticker.upper()]
+            if filtered:
+                return filtered[0].figi
+            else:
+                raise ValueError("Инструмент не найден")
+    except Exception as e:
+        logging.error(f"Ошибка получения FIGI: {e}")
+        raise
 
-async def fetch_candles(figi: str, days: int = 90):
-    hourly_candles = []
-    minute_candles = []
-    async with AsyncClient(TOKEN) as client:
-        async for candle in client.get_all_candles(
-            figi=figi,
-            from_=now() - timedelta(days=days),
-            to=now() - timedelta(minutes=60),
-            interval=CandleInterval.CANDLE_INTERVAL_HOUR
-        ):
-            hourly_candles.append({
-                "time": candle.time,
-                "open": float(quotation_to_decimal(candle.open)),
-                "high": float(quotation_to_decimal(candle.high)),
-                "low": float(quotation_to_decimal(candle.low)),
-                "close": float(quotation_to_decimal(candle.close)),
-                "volume": candle.volume,
-                "timeframe": "hour"
-            })
-        async for candle in client.get_all_candles(
-            figi=figi,
-            from_=now() - timedelta(minutes=60),
-            to=now(),
-            interval=CandleInterval.CANDLE_INTERVAL_1_MIN
-        ):
-            minute_candles.append({
-                "time": candle.time,
-                "open": float(quotation_to_decimal(candle.open)),
-                "high": float(quotation_to_decimal(candle.high)),
-                "low": float(quotation_to_decimal(candle.low)),
-                "close": float(quotation_to_decimal(candle.close)),
-                "volume": candle.volume,
-                "timeframe": "minute"
-            })
-    df_hour = pd.DataFrame(hourly_candles)
-    df_minute = pd.DataFrame(minute_candles)
-    if not df_hour.empty and not df_minute.empty:
-        if len(df_minute) >= 30:
-            df_minute["time"] = pd.to_datetime(df_minute["time"])
-            df_minute.set_index("time", inplace=True)
-            minute_to_hour = df_minute.resample("1h").agg({
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum"
-            }).reset_index()
-            minute_to_hour["timeframe"] = "hour_from_minute"
-            all_candles = pd.concat([df_hour, minute_to_hour])
-        else:
-            all_candles = pd.concat([df_hour, df_minute])
-    elif not df_hour.empty:
-        all_candles = df_hour
+async def fetch_candles(figi: str, days: int = 90) -> pd.DataFrame:
+    hourly_candles: List[Dict[str, Any]] = []
+    minute_candles: List[Dict[str, Any]] = []
+    retries: int = 0
+    max_retries: int = 5
+    delay: int = 1
+    while retries < max_retries:
+        try:
+            async with AsyncClient(TOKEN) as client:
+                async for candle in client.get_all_candles(
+                    figi=figi,
+                    from_=now() - timedelta(days=days),
+                    to=now() - timedelta(minutes=60),
+                    interval=CandleInterval.CANDLE_INTERVAL_HOUR
+                ):
+                    hourly_candles.append({
+                        "time": candle.time,
+                        "open": float(quotation_to_decimal(candle.open)),
+                        "high": float(quotation_to_decimal(candle.high)),
+                        "low": float(quotation_to_decimal(candle.low)),
+                        "close": float(quotation_to_decimal(candle.close)),
+                        "volume": candle.volume,
+                        "timeframe": "hour"
+                    })
+                async for candle in client.get_all_candles(
+                    figi=figi,
+                    from_=now() - timedelta(minutes=60),
+                    to=now(),
+                    interval=CandleInterval.CANDLE_INTERVAL_1_MIN
+                ):
+                    minute_candles.append({
+                        "time": candle.time,
+                        "open": float(quotation_to_decimal(candle.open)),
+                        "high": float(quotation_to_decimal(candle.high)),
+                        "low": float(quotation_to_decimal(candle.low)),
+                        "close": float(quotation_to_decimal(candle.close)),
+                        "volume": candle.volume,
+                        "timeframe": "minute"
+                    })
+            break
+        except Exception as e:
+            logging.warning(f"Ошибка получения свечей: {e}. Повтор через {delay} сек.")
+            retries += 1
+            await asyncio.sleep(delay)
+            delay *= 2
+    if retries == max_retries:
+        logging.error("Не удалось получить данные свечей.")
+        return pd.DataFrame()
+    df_hour: pd.DataFrame = pd.DataFrame(hourly_candles)
+    df_minute: pd.DataFrame = pd.DataFrame(minute_candles)
+    if not df_hour.empty:
+        df = df_hour.copy()
     elif not df_minute.empty:
-        all_candles = df_minute
+        df_minute["time"] = pd.to_datetime(df_minute["time"])
+        df = df_minute.resample("1h", on="time").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        })
+        df["timeframe"] = "hour_from_minute"
     else:
         return pd.DataFrame()
-    if not all_candles.empty:
-        all_candles["time"] = pd.to_datetime(all_candles["time"])
-        all_candles.sort_values("time", inplace=True)
-        all_candles.set_index("time", inplace=True)
-        all_candles["last_raw_close"] = all_candles["close"].iloc[-1]
-    return all_candles
+    if not df.empty:
+        df.index = pd.to_datetime(df.index)
+        df.sort_index(inplace=True)
+        df["last_raw_close"] = df["close"].iloc[-1]
+    return df
 
-def preprocess_data(df: pd.DataFrame):
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df["last_raw_close"] = df["close"].iloc[-1]
     df = df.sort_index()
-    hourly_data = df[df["timeframe"] == "hour"].copy()
+    hourly_data: pd.DataFrame = df[df["timeframe"] == "hour"].copy()
     if not hourly_data.empty:
         expected_hours = pd.date_range(start=hourly_data.index.min(), end=hourly_data.index.max(), freq="h")
         missing_hours = expected_hours.difference(hourly_data.index)
         if len(missing_hours) > 0:
-            missing_percent = len(missing_hours) / len(expected_hours) * 100
-            if missing_percent < 30:
-                for missing_hour in missing_hours:
-                    before = hourly_data[hourly_data.index < missing_hour]
-                    after = hourly_data[hourly_data.index > missing_hour]
-                    if not before.empty and not after.empty:
-                        closest_before = before.iloc[-1]
-                        closest_after = after.iloc[0]
-                        time_delta = (closest_after.name - closest_before.name).total_seconds()
-                        time_ratio = (missing_hour - closest_before.name).total_seconds() / time_delta
-                        new_row = closest_before.copy()
-                        for col in ["open", "high", "low", "close"]:
-                            new_row[col] = closest_before[col] + time_ratio * (closest_after[col] - closest_before[col])
-                        new_row["volume"] = int((closest_before["volume"] + closest_after["volume"]) / 2)
-                        new_row.name = missing_hour
-                        df.loc[missing_hour] = new_row
+            for missing_hour in missing_hours:
+                before = hourly_data[hourly_data.index < missing_hour]
+                if before.empty:
+                    continue
+                last_candle = before.iloc[-1]
+                fill = last_candle.copy()
+                fill["open"] = last_candle["close"]
+                fill["high"] = last_candle["close"]
+                fill["low"] = last_candle["close"]
+                fill["close"] = last_candle["close"]
+                fill["volume"] = 0
+                fill.name = missing_hour
+                df.loc[missing_hour] = fill
     df = df.sort_index()
     df["close_smooth"] = df["close"].rolling(window=2, min_periods=2).mean()
-    window_size = min(10, len(df))
+    window_size: int = min(10, len(df))
     if window_size < 4:
         df["close_clean"] = df["close_smooth"]
     else:
         roll_med = df["close_smooth"].rolling(window=window_size, min_periods=2).median()
         roll_std = df["close_smooth"].rolling(window=window_size, min_periods=2).std().fillna(0)
         diff = np.abs(df["close_smooth"] - roll_med)
-        threshold_factor = 3.0 if len(df) > 30 else 4.0
+        threshold_factor: float = 3.0 if len(df) > 30 else 4.0
         threshold = threshold_factor * roll_std
         df["close_clean"] = np.where(diff > threshold, roll_med, df["close_smooth"])
     last_hour_mask = df.index >= (df.index.max() - pd.Timedelta(hours=1))
@@ -147,7 +156,7 @@ def preprocess_data(df: pd.DataFrame):
     df["close_clean"] = df["close_clean"].fillna(df["close"])
     return df
 
-def calculate_indicators(df: pd.DataFrame):
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["sma20"] = df["close_clean"].rolling(window=20).mean()
     df["ema20"] = df["close_clean"].ewm(span=20, adjust=False).mean()
     delta = df["close_clean"].diff()
@@ -171,7 +180,7 @@ def calculate_indicators(df: pd.DataFrame):
     df["vol_ma20"] = df["volume"].rolling(window=20).mean()
     return df
 
-def create_fourier_features(df: pd.DataFrame, periods=[24, 168], order=3):
+def create_fourier_features(df: pd.DataFrame, periods: List[int] = [24, 168], order: int = 3) -> pd.DataFrame:
     df = df.copy()
     df["time_int"] = df.index.astype(np.int64) // 10**9
     for period in periods:
@@ -181,7 +190,7 @@ def create_fourier_features(df: pd.DataFrame, periods=[24, 168], order=3):
     df.drop(columns=["time_int"], inplace=True)
     return df
 
-def create_features(df: pd.DataFrame, lags: int = 3):
+def create_features(df: pd.DataFrame, lags: int = 3) -> Tuple[pd.DataFrame, List[str]]:
     for i in range(1, lags + 1):
         df[f"lag_{i}"] = df["close_clean"].shift(i)
     for i in range(1, lags + 1):
@@ -191,13 +200,15 @@ def create_features(df: pd.DataFrame, lags: int = 3):
             df[col] = df[col].ffill().bfill().fillna(0)
     df = create_fourier_features(df)
     df = df.dropna()
-    feature_cols = [f"lag_{i}" for i in range(1, lags + 1)] + ["sma20", "ema20", "rsi", "macd", "macd_signal", "bb_upper", "bb_lower", "stoch", "ema50", "vol_ma20"]
+    feature_cols: List[str] = [f"lag_{i}" for i in range(1, lags + 1)] + [
+        "sma20", "ema20", "rsi", "macd", "macd_signal", "bb_upper", "bb_lower", "stoch", "ema50", "vol_ma20"
+    ]
     fourier_cols = [col for col in df.columns if col.startswith("sin_") or col.startswith("cos_")]
     feature_cols += fourier_cols
     feature_cols = [col for col in feature_cols if col in df.columns]
     return df, feature_cols
 
-def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
+def train_model_enhanced(df: pd.DataFrame, lags: int = 3) -> Tuple[Any, StandardScaler, StandardScaler, List[str], pd.DataFrame]:
     if len(df) < 30:
         dummy_model = DummyRegressor(strategy="mean")
         dummy_model.fit(np.array([[0]]), np.array([df["close_clean"].mean()]))
@@ -218,8 +229,8 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
     tscv = TimeSeriesSplit(n_splits=3)
     X_train = train_df[feature_cols].values
     y_train = train_df["close_clean"].values.reshape(-1, 1)
-    lower_bounds = {}
-    upper_bounds = {}
+    lower_bounds: Dict[int, float] = {}
+    upper_bounds: Dict[int, float] = {}
     for i in range(X_train.shape[1]):
         col_data = X_train[:, i]
         q1, q3 = np.percentile(col_data, [25, 75])
@@ -286,24 +297,18 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3):
         mae = mean_absolute_error(y_test, pred_test)
         rmse = np.sqrt(mean_squared_error(y_test, pred_test))
         r2 = r2_score(y_test, pred_test)
-        direction_pred = np.sign(np.diff(np.append([y_test[0]], pred_test)))
-        direction_actual = np.sign(np.diff(y_test))
-        direction_accuracy = np.mean(direction_pred[:-1] == direction_actual) * 100
-        naive_pred = np.roll(y_test, 1)
-        naive_pred[0] = y_test[0]
-        naive_mae = mean_absolute_error(y_test[1:], naive_pred[1:])
-        naive_rmse = np.sqrt(mean_squared_error(y_test[1:], naive_pred[1:]))
     return best_model, scaler_X, scaler_y, feature_cols, df_feat
 
-def predict_multiple_steps_enhanced(model, scaler_X, scaler_y, feature_cols, df, steps=5, lags=3):
-    predictions = []
-    df_pred = df.copy()
+def predict_multiple_steps_enhanced(model: Any, scaler_X: StandardScaler, scaler_y: StandardScaler, feature_cols: List[str], df: pd.DataFrame, steps: int = 5, lags: int = 3) -> List[float]:
+    predictions: List[float] = []
+    df_pred: pd.DataFrame = df.copy()
+    alpha: float = 0.7
     for _ in range(steps):
         last_row = df_pred.iloc[-1]
         input_vector = last_row[feature_cols].values.reshape(1, -1)
         input_scaled = scaler_X.transform(input_vector)
-        pred_scaled = model.predict(input_scaled)
-        pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0, 0]
+        model_pred = scaler_y.inverse_transform(model.predict(input_scaled).reshape(-1, 1))[0, 0]
+        pred = alpha * model_pred + (1 - alpha) * last_row["close_clean"]
         predictions.append(pred)
         new_row = last_row.copy()
         new_row["close_clean"] = pred
@@ -315,7 +320,7 @@ def predict_multiple_steps_enhanced(model, scaler_X, scaler_y, feature_cols, df,
         df_pred = pd.concat([df_pred, new_row.to_frame().T])
     return predictions
 
-def detect_regime(df: pd.DataFrame):
+def detect_regime(df: pd.DataFrame) -> Dict[str, float]:
     if len(df) < 30:
         return {"0": 0.5, "1": 0.5}
     returns = df["close_clean"].pct_change().dropna()
@@ -355,13 +360,14 @@ def detect_regime(df: pd.DataFrame):
         regimes = {"0": 0.5, "1": 0.5}
     return regimes
 
-def analyze_market(ind, current_price, predictions, df=None):
-    score = 0
-    factors = []
+def analyze_market(ind: Dict[str, float], current_price: float, predictions: List[float], df: pd.DataFrame = None) -> str:
+    weights: Dict[str, float] = {"rsi": 0.3, "macd": 0.3, "ema": 0.2, "stoch": 0.2}
+    score: float = 0
+    factors: List[str] = []
     if df is not None and len(df) > 20:
         recent_vol = df["close_clean"].pct_change().rolling(window=5).std().iloc[-1]
         hist_vol = df["close_clean"].pct_change().rolling(window=20).std().iloc[-1]
-        if hist_vol > 0 and recent_vol > hist_vol * 2:
+        if hist_vol > 0 and recent_vol > 2 * hist_vol:
             score -= 3
             factors.append("Высокая волатильность")
     if df is not None and len(df) > 1:
@@ -375,50 +381,16 @@ def analyze_market(ind, current_price, predictions, df=None):
                 score -= 3
                 factors.append("Гэп вниз")
     rsi = ind["rsi"]
-    score += (50 - rsi) / 10
+    score += weights["rsi"] * ((50 - rsi) / 10)
     macd_diff = ind["macd"] - ind["macd_signal"]
-    score += macd_diff
-    bb_mid = (ind["bb_upper"] + ind["bb_lower"]) / 2
-    score += (bb_mid - current_price) / bb_mid * 3
-    if current_price > ind["ema20"] and ind["ema20"] > ind["ema50"]:
-        score += 3
-        factors.append("Восходящий EMA")
-    elif current_price < ind["ema20"] and ind["ema20"] < ind["ema50"]:
-        score -= 3
-        factors.append("Нисходящий EMA")
-    if ind["stoch"] < 20:
-        score += 2
-        factors.append("Перепродан Stoch")
-    elif ind["stoch"] > 80:
-        score -= 2
-        factors.append("Перекуплен Stoch")
-    if df is not None and len(df) > 5:
-        last_vol = df["volume"].iloc[-1]
-        avg_vol = df["vol_ma20"].iloc[-1]
-        vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio > 3.0:
-            last_close = df["close_clean"].iloc[-1]
-            prev_close = df["close_clean"].iloc[-2] if len(df) > 2 else last_close
-            if last_close > prev_close:
-                score += 4
-                factors.append("Большие покупки")
-            else:
-                score -= 4
-                factors.append("Большие продажи")
-        elif vol_ratio > 2.0:
-            last_close = df["close_clean"].iloc[-1]
-            prev_close = df["close_clean"].iloc[-2] if len(df) > 2 else last_close
-            if last_close > prev_close:
-                score += 3
-                factors.append("Повышенные покупки")
-            else:
-                score -= 3
-                factors.append("Повышенные продажи")
+    score += weights["macd"] * macd_diff
+    ema_trend = 3 if (current_price > ind["ema20"] and ind["ema20"] > ind["ema50"]) else -3 if (current_price < ind["ema20"] and ind["ema20"] < ind["ema50"]) else 0
+    score += weights["ema"] * ema_trend
+    stoch_signal = 2 if ind["stoch"] < 20 else -2 if ind["stoch"] > 80 else 0
+    score += weights["stoch"] * stoch_signal
     regimes = detect_regime(df) if df is not None else {"0": 0.5, "1": 0.5}
-    bullish_regime_prob = regimes.get("0", 0.5)
-    bearish_regime_prob = regimes.get("1", 0.5)
-    score += (bullish_regime_prob - bearish_regime_prob) * 10
-    factors.append(f"Режим: {bullish_regime_prob*100:.0f}%")
+    bullish_regime = regimes.get("0", 0.5)
+    score += (bullish_regime - 0.5) * 10
     if score >= 3:
         signal = "СИГНАЛ к ЛОНГУ"
     elif score <= -3:
@@ -428,33 +400,39 @@ def analyze_market(ind, current_price, predictions, df=None):
     return f"{signal} (score: {score:.1f}) - {', '.join(factors[:3])}"
 
 class PredictionTracker:
-    def __init__(self, ticker):
-        self.ticker = ticker
-        self.predictions = {}
-        self.filename = f"{ticker}_predictions.pkl"
+    def __init__(self, ticker: str) -> None:
+        self.ticker: str = ticker
+        self.predictions: Dict[str, Dict[str, Any]] = {}
+        self.filename: str = f"{ticker}_predictions.pkl"
         self.load_history()
-    def load_history(self):
+    def load_history(self) -> None:
         try:
             if os.path.exists(self.filename):
                 with open(self.filename, "rb") as f:
                     self.predictions = pickle.load(f)
         except Exception:
             self.predictions = {}
-    def save_history(self):
+    def save_history(self) -> None:
         try:
             with open(self.filename, "wb") as f:
                 pickle.dump(self.predictions, f)
         except Exception:
             pass
-    def add_predictions(self, timestamp, predictions, intervals):
+    def add_predictions(self, timestamp: datetime, predictions: List[float], intervals: List[int], base_price: float) -> None:
         ts = timestamp.strftime("%Y-%m-%d %H:%M:%S")
         self.predictions[ts] = {}
         for i, pred in enumerate(predictions):
             if i < len(intervals):
                 interval = intervals[i]
-                self.predictions[ts][interval] = {"prediction": pred, "actual": None, "timestamp": timestamp, "target_time": timestamp + timedelta(minutes=interval)}
+                self.predictions[ts][str(interval)] = {
+                    "prediction": pred,
+                    "actual": None,
+                    "timestamp": timestamp,
+                    "target_time": timestamp + timedelta(minutes=interval),
+                    "base_price": base_price
+                }
         self.save_history()
-    def update_actuals(self, current_time, price):
+    def update_actuals(self, current_time: datetime, price: float) -> None:
         updated = False
         for ts, intervals in list(self.predictions.items()):
             for interval, data in list(intervals.items()):
@@ -469,59 +447,53 @@ class PredictionTracker:
                 updated = True
         if updated:
             self.save_history()
-    def get_accuracy_stats(self):
+    def get_accuracy_stats(self) -> Dict[str, Any]:
         if not self.predictions:
             return {}
         completed = []
         for ts, intervals in self.predictions.items():
             for interval, data in intervals.items():
                 if data["actual"] is not None:
+                    base_price = data.get("base_price", data["prediction"])
+                    pred_direction = 1 if data["prediction"] > base_price else -1 if data["prediction"] < base_price else 0
+                    actual_direction = 1 if data["actual"] > base_price else -1 if data["actual"] < base_price else 0
+                    direction_correct = pred_direction == actual_direction
                     error = abs(data["prediction"] - data["actual"]) / data["actual"] * 100
-                    direction_pred = 1 if data["prediction"] > data["actual"] else -1 if data["prediction"] < data["actual"] else 0
-                    direction_actual = 1 if data["actual"] > data["actual"] else -1 if data["actual"] < data["actual"] else 0
-                    direction_correct = direction_pred == direction_actual
-                    days_old = (datetime.now() - data["timestamp"]).total_seconds() / (24 * 3600)
-                    weight = max(0.5, 1.0 - (days_old / 3.0))
-                    completed.append({"interval": interval, "error": error, "direction_correct": direction_correct, "time_weight": weight})
+                    completed.append({
+                        "interval": interval,
+                        "error": error,
+                        "direction_correct": direction_correct
+                    })
         if not completed:
             return {}
-        stats = {}
+        stats: Dict[str, Dict[str, float]] = {}
         for pred in completed:
             interval = pred["interval"]
             if interval not in stats:
-                stats[interval] = {"count": 0, "error_sum": 0, "correct": 0, "weighted_count": 0, "weighted_error_sum": 0, "weighted_correct": 0}
+                stats[interval] = {"count": 0, "error_sum": 0, "correct": 0}
             stats[interval]["count"] += 1
             stats[interval]["error_sum"] += pred["error"]
             stats[interval]["correct"] += 1 if pred["direction_correct"] else 0
-            stats[interval]["weighted_count"] += pred["time_weight"]
-            stats[interval]["weighted_error_sum"] += pred["error"] * pred["time_weight"]
-            stats[interval]["weighted_correct"] += pred["time_weight"] if pred["direction_correct"] else 0
-        total_count = sum(s["count"] for s in stats.values())
-        total_error = sum(s["error_sum"] for s in stats.values())
-        total_correct = sum(s["correct"] for s in stats.values())
-        total_weighted_count = sum(s["weighted_count"] for s in stats.values())
-        total_weighted_error = sum(s["weighted_error_sum"] for s in stats.values())
-        total_weighted_correct = sum(s["weighted_correct"] for s in stats.values())
-        overall = {
-            "total_count": total_count,
-            "avg_error": total_error / total_count if total_count > 0 else 0,
-            "direction_accuracy": total_correct / total_count * 100 if total_count > 0 else 0,
-            "weighted_avg_error": total_weighted_error / total_weighted_count if total_weighted_count > 0 else 0,
-            "weighted_direction_accuracy": total_weighted_correct / total_weighted_count * 100 if total_weighted_count > 0 else 0,
+        overall_count = sum(s["count"] for s in stats.values())
+        overall_error = sum(s["error_sum"] for s in stats.values())
+        overall_correct = sum(s["correct"] for s in stats.values())
+        return {
+            "total_count": overall_count,
+            "avg_error": overall_error / overall_count if overall_count > 0 else 0,
+            "direction_accuracy": overall_correct / overall_count * 100 if overall_count > 0 else 0,
             "by_interval": stats
         }
-        return overall
 
-def clear_terminal():
+def clear_terminal() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
-def show_loading_animation(message="Загрузка данных"):
+def show_loading_animation(message: str = "Загрузка данных") -> None:
     clear_terminal()
     print(f"\033[1;36m{message}...\033[0m")
     for _ in tqdm(range(100), desc="Прогресс", ncols=80, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}"):
         time.sleep(0.01)
 
-def calculate_risk_metrics(df, current_price, predictions):
+def calculate_risk_metrics(df: pd.DataFrame, current_price: float, predictions: List[float]) -> Dict[str, Any]:
     if df is None or len(df) < 30:
         return {"var_95": 0, "cvar": 0, "max_loss_pct": 0, "risk_level": "Неизвестно"}
     returns = df["close_clean"].pct_change().dropna()
@@ -533,28 +505,22 @@ def calculate_risk_metrics(df, current_price, predictions):
     rolling_max = df["close_clean"].rolling(window=30).max()
     daily_drawdown = df["close_clean"] / rolling_max - 1.0
     max_loss_pct = abs(daily_drawdown.min() * 100)
-    if var_95_pct > 5:
-        risk_level = "Высокий"
-    elif var_95_pct > 2:
-        risk_level = "Средний"
-    else:
-        risk_level = "Низкий"
+    risk_level = "Высокий" if var_95_pct > 5 else "Средний" if var_95_pct > 2 else "Низкий"
     return {"var_95": var_95, "cvar": cvar, "var_95_pct": var_95_pct, "max_loss_pct": max_loss_pct, "risk_level": risk_level}
 
-def generate_ascii_chart(prices, width=40, height=10):
+def generate_ascii_chart(prices: List[float], width: int = 40, height: int = 10) -> str:
     if not prices or len(prices) < 2:
         return "Недостаточно данных для построения графика"
     return ascii_chart.plot(prices, {"height": height, "width": width, "format": "{:,.2f}"})
 
-def print_report(ticker, figi, last_close, raw_close, predictions, current_time, indicators, regimes, analysis, accuracy_stats, risk_metrics, df):
+def print_report(ticker: str, figi: str, last_close: float, raw_close: float, predictions: List[float], current_time: datetime, indicators: Dict[str, float], regimes: Dict[str, float], analysis: str, accuracy_stats: Dict[str, Any], risk_metrics: Dict[str, Any], df: pd.DataFrame) -> None:
     GREEN = Fore.GREEN + Style.BRIGHT
     RED = Fore.RED + Style.BRIGHT
     YELLOW = Fore.YELLOW + Style.BRIGHT
     CYAN = Fore.CYAN + Style.BRIGHT
     MAGENTA = Fore.MAGENTA + Style.BRIGHT
     WHITE = Fore.WHITE + Style.BRIGHT
-    RESET = Style.RESET_ALL
-    historical_chart = ""
+    historical_chart: str = ""
     if df is not None and len(df) > 20:
         historical_values = df["close_clean"].iloc[-20:].tolist()
         historical_chart = generate_ascii_chart(historical_values, width=50, height=10)
@@ -563,10 +529,10 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
         for k, v in regimes.items():
             percentage = v * 100
             color = GREEN if k == "0" and percentage > 60 else RED if k == "1" and percentage > 60 else YELLOW
-            regime_items.append(f"{color}Режим {k}: {percentage:.1f}%{RESET}")
+            regime_items.append(f"{color}Режим {k}: {percentage:.1f}%{Style.RESET_ALL}")
         regime_str = " | ".join(regime_items)
     else:
-        regime_str = f"{YELLOW}Нет данных о режимах{RESET}"
+        regime_str = f"{YELLOW}Нет данных о режимах{Style.RESET_ALL}"
     vol_info = ""
     if "volume" in indicators and "vol_ma20" in indicators:
         last_vol = indicators.get("volume", 0)
@@ -587,7 +553,7 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
         else:
             vol_color = WHITE
             vol_symbol = "●"
-        vol_info = f"{CYAN}Объем:{RESET} {vol_color}{last_vol} ({vol_ratio:.2f}x) {vol_symbol}{RESET}"
+        vol_info = f"{CYAN}Объем:{Style.RESET_ALL} {vol_color}{last_vol} ({vol_ratio:.2f}x) {vol_symbol}{Style.RESET_ALL}"
     rsi_color = GREEN if indicators["rsi"] < 30 else RED if indicators["rsi"] > 70 else WHITE
     macd_color = GREEN if indicators["macd"] > indicators["macd_signal"] else RED
     bb_position = (raw_close - indicators["bb_lower"]) / (indicators["bb_upper"] - indicators["bb_lower"]) * 100
@@ -596,16 +562,18 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
     rsi_index = min(int(indicators["rsi"] / 12.5), 7)
     rsi_visual = rsi_bars[rsi_index]
     indicators_display = [
-        f"{CYAN}RSI:{RESET} {rsi_color}{indicators['rsi']:.1f} {rsi_visual}{RESET}",
-        f"{CYAN}MACD:{RESET} {macd_color}{indicators['macd']:.2f}/{indicators['macd_signal']:.2f}{RESET}",
-        f"{CYAN}BB:{RESET} {bb_color}{bb_position:.1f}%{RESET}",
-        f"{CYAN}EMA:{RESET} {indicators['ema20']:.2f}/{indicators['ema50']:.2f}",
+        f"{CYAN}RSI:{Style.RESET_ALL} {rsi_color}{indicators['rsi']:.1f} {rsi_visual}{Style.RESET_ALL}",
+        f"{CYAN}MACD:{Style.RESET_ALL} {macd_color}{indicators['macd']:.2f}/{indicators['macd_signal']:.2f}{Style.RESET_ALL}",
+        f"{CYAN}BB:{Style.RESET_ALL} {bb_color}{bb_position:.1f}%{Style.RESET_ALL}",
+        f"{CYAN}EMA:{Style.RESET_ALL} {indicators['ema20']:.2f}/{indicators['ema50']:.2f}",
         vol_info
     ]
-    detailed_indicators = (f"  EMA20: {indicators['ema20']:.2f} | SMA20: {indicators['sma20']:.2f} | RSI: {indicators['rsi']:.2f}\n"
-                             f"  MACD: {indicators['macd']:.2f} | MACD Signal: {indicators['macd_signal']:.2f}\n"
-                             f"  BB: Upper={indicators['bb_upper']:.2f} | Lower={indicators['bb_lower']:.2f}\n"
-                             f"  Stoch: {indicators['stoch']:.2f} | EMA50: {indicators['ema50']:.2f} | Vol_MA20: {indicators['vol_ma20']:.2f}")
+    detailed_indicators = (
+        f"  EMA20: {indicators['ema20']:.2f} | SMA20: {indicators['sma20']:.2f} | RSI: {indicators['rsi']:.2f}\n"
+        f"  MACD: {indicators['macd']:.2f} | MACD Signal: {indicators['macd_signal']:.2f}\n"
+        f"  BB: Upper={indicators['bb_upper']:.2f} | Lower={indicators['bb_lower']:.2f}\n"
+        f"  Stoch: {indicators['stoch']:.2f} | EMA50: {indicators['ema50']:.2f} | Vol_MA20: {indicators['vol_ma20']:.2f}"
+    )
     risk_info = ""
     if risk_metrics:
         if risk_metrics["risk_level"] == "Высокий":
@@ -624,18 +592,20 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
         var_bars = "▁▂▃▄▅▆▇█"
         var_index = min(int(var_pct / 1.25), 7)
         var_visual = var_bars[var_index]
-        risk_info = (f"\n{CYAN}┌─ ОЦЕНКА РИСКА ────────────────────────────────────────────┐{RESET}\n"
-                     f"{CYAN}│{RESET} Уровень: {risk_color}{risk_metrics['risk_level']} {risk_symbol}{RESET}\n"
-                     f"{CYAN}│{RESET} VaR 95%: {risk_color}{risk_metrics['var_95']:.2f} ({risk_metrics.get('var_95_pct', 0):.2f}%) {var_visual}{RESET}\n"
-                     f"{CYAN}│{RESET} CVaR: {risk_color}{risk_metrics.get('cvar', 0):.2f}{RESET}\n"
-                     f"{CYAN}│{RESET} Макс. просадка: {risk_metrics['max_loss_pct']:.2f}%\n"
-                     f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}")
+        risk_info = (
+            f"\n{CYAN}┌─ ОЦЕНКА РИСКА ────────────────────────────────────────────┐{Style.RESET_ALL}\n"
+            f"{CYAN}│{Style.RESET_ALL} Уровень: {risk_color}{risk_metrics['risk_level']} {risk_symbol}{Style.RESET_ALL}\n"
+            f"{CYAN}│{Style.RESET_ALL} VaR 95%: {risk_color}{risk_metrics['var_95']:.2f} ({risk_metrics.get('var_95_pct', 0):.2f}%) {var_visual}{Style.RESET_ALL}\n"
+            f"{CYAN}│{Style.RESET_ALL} CVaR: {risk_color}{risk_metrics.get('cvar', 0):.2f}{Style.RESET_ALL}\n"
+            f"{CYAN}│{Style.RESET_ALL} Макс. просадка: {risk_metrics['max_loss_pct']:.2f}%\n"
+            f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+        )
     if "СИГНАЛ к ЛОНГУ" in analysis:
-        signal_part = f"{GREEN}СИГНАЛ к ЛОНГУ{RESET}"
+        signal_part = f"{GREEN}СИГНАЛ к ЛОНГУ{Style.RESET_ALL}"
     elif "СИГНАЛ к ШОРТУ" in analysis:
-        signal_part = f"{RED}СИГНАЛ к ШОРТУ{RESET}"
+        signal_part = f"{RED}СИГНАЛ к ШОРТУ{Style.RESET_ALL}"
     else:
-        signal_part = f"{YELLOW}РЫНОК НЕЙТРАЛЕН{RESET}"
+        signal_part = f"{YELLOW}РЫНОК НЕЙТРАЛЕН{Style.RESET_ALL}"
     if "(" in analysis and ")" in analysis:
         try:
             score_value = float(analysis.split("score:")[1].split(")")[0])
@@ -645,61 +615,75 @@ def print_report(ticker, figi, last_close, raw_close, predictions, current_time,
         strength_bars = "▁▂▃▄▅▆▇█"
         strength_index = min(int((score_value + 5) / 10 * 7), 7)
         strength_visual = strength_bars[strength_index]
-        strength_part = f"{strength_color}{score_value:.1f} {strength_visual}{RESET}"
+        strength_part = f"{strength_color}{score_value:.1f} {strength_visual}{Style.RESET_ALL}"
         reason_part = analysis.split("-")[1].strip() if "-" in analysis else ""
     else:
         strength_part = ""
         reason_part = ""
     analysis_formatted = f"{signal_part} ({strength_part}) - {reason_part}"
-    header = (f"\n{MAGENTA}{'='*70}{RESET}\n"
-              f"{MAGENTA}║{RESET} {WHITE}{ticker.upper()} - Торговый анализ{RESET}{' '*40}{MAGENTA}║{RESET}\n"
-              f"{MAGENTA}{'='*70}{RESET}\n")
-    timestamp = (f"{CYAN}┌─ ИНФОРМАЦИЯ ─────────────────────────────────────────────┐{RESET}\n"
-                 f"{CYAN}│{RESET} Дата и время: {WHITE}{current_time.strftime('%Y-%m-%d %H:%M:%S')}{RESET}\n"
-                 f"{CYAN}│{RESET} Тикер: {WHITE}{ticker.upper()}{RESET}  FIGI: {figi}\n"
-                 f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}")
-    prices = (f"{CYAN}┌─ ТЕКУЩИЕ ЦЕНЫ ───────────────────────────────────────────┐{RESET}\n"
-              f"{CYAN}│{RESET} Рыночная цена: {WHITE}{raw_close:.2f}{RESET}\n"
-              f"{CYAN}│{RESET} Цена закрытия: {WHITE}{last_close:.2f}{RESET}\n"
-              f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}")
-    market_analysis = (f"{CYAN}┌─ АНАЛИЗ РЫНКА ───────────────────────────────────────────┐{RESET}\n"
-                       f"{CYAN}│{RESET} {analysis_formatted}\n"
-                       f"{CYAN}│{RESET} Режим: {regime_str}\n"
-                       f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}")
-    indicators_section = (f"{CYAN}┌─ ИНДИКАТОРЫ ────────────────────────────────────────────┐{RESET}\n"
-                          f"{CYAN}│{RESET} {' | '.join(indicators_display)}\n"
-                          f"{CYAN}│{RESET}\n"
-                          f"{CYAN}│{RESET} {detailed_indicators}\n"
-                          f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}")
+    header = (
+        f"\n{MAGENTA}{'=' * 70}{Style.RESET_ALL}\n"
+        f"{MAGENTA}║{Style.RESET_ALL} {WHITE}{ticker.upper()} - Торговый анализ{Style.RESET_ALL}{' ' * 40}{MAGENTA}║{Style.RESET_ALL}\n"
+        f"{MAGENTA}{'=' * 70}{Style.RESET_ALL}\n"
+    )
+    timestamp = (
+        f"{CYAN}┌─ ИНФОРМАЦИЯ ─────────────────────────────────────────────┐{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} Дата и время: {WHITE}{current_time.strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} Тикер: {WHITE}{ticker.upper()}{Style.RESET_ALL}  FIGI: {figi}\n"
+        f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+    )
+    prices = (
+        f"{CYAN}┌─ ТЕКУЩИЕ ЦЕНЫ ───────────────────────────────────────────┐{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} Рыночная цена: {WHITE}{raw_close:.2f}{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} Цена закрытия: {WHITE}{last_close:.2f}{Style.RESET_ALL}\n"
+        f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+    )
+    market_analysis = (
+        f"{CYAN}┌─ АНАЛИЗ РЫНКА ───────────────────────────────────────────┐{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} {analysis_formatted}\n"
+        f"{CYAN}│{Style.RESET_ALL} Режим: {regime_str}\n"
+        f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+    )
+    indicators_section = (
+        f"{CYAN}┌─ ИНДИКАТОРЫ ────────────────────────────────────────────┐{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} {' | '.join(indicators_display)}\n"
+        f"{CYAN}│{Style.RESET_ALL}\n"
+        f"{CYAN}│{Style.RESET_ALL} {detailed_indicators}\n"
+        f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+    )
     history_section = ""
     if historical_chart:
-        history_section = (f"{CYAN}┌─ ИСТОРИЯ ЦЕН (последние 20 точек) ─────────────────────┐{RESET}\n"
-                           f"{historical_chart}\n"
-                           f"{CYAN}└────────────────────────────────────────────────────────────┘{RESET}")
-    report = (f"{header}\n"
-              f"{timestamp}\n\n"
-              f"{prices}\n\n"
-              f"{market_analysis}\n\n"
-              f"{indicators_section}\n"
-              f"{history_section}\n"
-              f"{risk_info}\n\n"
-              f"{MAGENTA}{'='*70}{RESET}\n")
+        history_section = (
+            f"{CYAN}┌─ ИСТОРИЯ ЦЕН (последние 20 точек) ─────────────────────┐{Style.RESET_ALL}\n"
+            f"{historical_chart}\n"
+            f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+        )
+    report = (
+        f"{header}\n"
+        f"{timestamp}\n\n"
+        f"{prices}\n\n"
+        f"{market_analysis}\n\n"
+        f"{indicators_section}\n"
+        f"{history_section}\n"
+        f"{risk_info}\n\n"
+        f"{MAGENTA}{'=' * 70}{Style.RESET_ALL}\n"
+    )
     print(report)
 
-async def main():
-    ticker = input("Введите тикер: ")
+async def main() -> None:
+    ticker: str = input("Введите тикер: ")
     try:
-        figi = get_figi_by_ticker(ticker)
-    except ValueError as e:
-        print(f"Ошибка: {e}")
+        figi: str = get_figi_by_ticker(ticker)
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
         return
-    last_update_time = datetime.now() - timedelta(minutes=10)
-    model_update_interval = timedelta(minutes=30)
-    data_update_interval = timedelta(seconds=10)
-    async def get_current_price():
-        retry_count = 0
-        max_retries = 3
-        retry_delay = 2
+    last_update_time: datetime = datetime.now() - timedelta(minutes=10)
+    model_update_interval: timedelta = timedelta(minutes=30)
+    data_update_interval: timedelta = timedelta(seconds=10)
+    async def get_current_price() -> Any:
+        retry_count: int = 0
+        max_retries: int = 3
+        retry_delay: int = 2
         while retry_count < max_retries:
             try:
                 async with AsyncClient(TOKEN) as client:
@@ -715,53 +699,58 @@ async def main():
         if df_cache is not None and "last_raw_close" in df_cache:
             return df_cache["last_raw_close"]
         return None
-    df_cache = None
-    df_features_cache = None
-    predictions_cache = None
-    regimes_cache = {}
-    model_cache = None
-    scaler_X_cache = None
-    scaler_y_cache = None
-    feature_cols_cache = None
-    while True:
-        current_time = datetime.now()
-        current_market_price = await get_current_price()
-        need_model_update = (current_time - last_update_time) > model_update_interval
-        if need_model_update or df_cache is None:
-            show_loading_animation("Обновление данных")
-            df = await fetch_candles(figi, days=90)
-            last_update_time = current_time
-            if df.empty:
-                await asyncio.sleep(30)
-                continue
-            df = preprocess_data(df)
-            df = calculate_indicators(df)
-            model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features = train_model_enhanced(df, lags=3)
-            predictions = predict_multiple_steps_enhanced(model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features, steps=5, lags=3)
-            df_cache = df
-            df_features_cache = df_features
-            predictions_cache = predictions
-            regimes_cache = detect_regime(df)
-        last_close = df_cache["close_clean"].iloc[-1]
-        raw_close = current_market_price if current_market_price else df_cache["last_raw_close"]
-        indicators = {
-            "ema20": df_cache["ema20"].iloc[-1],
-            "sma20": df_cache["sma20"].iloc[-1],
-            "rsi": df_cache["rsi"].iloc[-1],
-            "macd": df_cache["macd"].iloc[-1],
-            "macd_signal": df_cache["macd_signal"].iloc[-1],
-            "bb_upper": df_cache["bb_upper"].iloc[-1],
-            "bb_lower": df_cache["bb_lower"].iloc[-1],
-            "stoch": df_cache["stoch"].iloc[-1],
-            "ema50": df_cache["ema50"].iloc[-1],
-            "vol_ma20": df_cache["vol_ma20"].iloc[-1],
-            "volume": df_cache["volume"].iloc[-1]
-        }
-        analysis = analyze_market(indicators, raw_close, predictions_cache, df_cache)
-        risk_metrics = calculate_risk_metrics(df_cache, raw_close, predictions_cache)
-        clear_terminal()
-        print_report(ticker, figi, last_close, raw_close, predictions_cache, current_time, indicators, regimes_cache, analysis, None, risk_metrics, df_cache)
-        await asyncio.sleep(data_update_interval.total_seconds())
+    df_cache: Any = None
+    df_features_cache: Any = None
+    predictions_cache: List[float] = []
+    regimes_cache: Dict[str, float] = {}
+    model_cache: Any = None
+    scaler_X_cache: Any = None
+    scaler_y_cache: Any = None
+    feature_cols_cache: List[str] = []
+    try:
+        while True:
+            current_time = datetime.now()
+            current_market_price = await get_current_price()
+            need_model_update = (current_time - last_update_time) > model_update_interval
+            if need_model_update or df_cache is None:
+                show_loading_animation("Обновление данных")
+                df: pd.DataFrame = await fetch_candles(figi, days=90)
+                last_update_time = current_time
+                if df.empty:
+                    await asyncio.sleep(30)
+                    continue
+                df = preprocess_data(df)
+                df = calculate_indicators(df)
+                model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features = train_model_enhanced(df, lags=3)
+                predictions = predict_multiple_steps_enhanced(model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features, steps=5, lags=3)
+                df_cache = df
+                df_features_cache = df_features
+                predictions_cache = predictions
+                regimes_cache = detect_regime(df)
+            last_close: float = df_cache["close_clean"].iloc[-1]
+            raw_close: float = current_market_price if current_market_price else df_cache["last_raw_close"]
+            indicators: Dict[str, float] = {
+                "ema20": df_cache["ema20"].iloc[-1],
+                "sma20": df_cache["sma20"].iloc[-1],
+                "rsi": df_cache["rsi"].iloc[-1],
+                "macd": df_cache["macd"].iloc[-1],
+                "macd_signal": df_cache["macd_signal"].iloc[-1],
+                "bb_upper": df_cache["bb_upper"].iloc[-1],
+                "bb_lower": df_cache["bb_lower"].iloc[-1],
+                "stoch": df_cache["stoch"].iloc[-1],
+                "ema50": df_cache["ema50"].iloc[-1],
+                "vol_ma20": df_cache["vol_ma20"].iloc[-1],
+                "volume": df_cache["volume"].iloc[-1]
+            }
+            analysis: str = analyze_market(indicators, raw_close, predictions_cache, df_cache)
+            risk_metrics: Dict[str, Any] = calculate_risk_metrics(df_cache, raw_close, predictions_cache)
+            clear_terminal()
+            print_report(ticker, figi, last_close, raw_close, predictions_cache, current_time, indicators, regimes_cache, analysis, {}, risk_metrics, df_cache)
+            await asyncio.sleep(data_update_interval.total_seconds())
+    except KeyboardInterrupt:
+        logging.info("Завершение работы...")
+    except Exception as e:
+        logging.error(f"Ошибка основного цикла: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
