@@ -24,7 +24,6 @@ from tqdm import tqdm
 
 init(autoreset=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-
 TOKEN: str = os.environ.get("TINKOFF_TOKEN")
 if not TOKEN:
     import getpass
@@ -299,26 +298,210 @@ def train_model_enhanced(df: pd.DataFrame, lags: int = 3) -> Tuple[Any, Standard
         r2 = r2_score(y_test, pred_test)
     return best_model, scaler_X, scaler_y, feature_cols, df_feat
 
-def predict_multiple_steps_enhanced(model: Any, scaler_X: StandardScaler, scaler_y: StandardScaler, feature_cols: List[str], df: pd.DataFrame, steps: int = 5, lags: int = 3) -> List[float]:
-    predictions: List[float] = []
-    df_pred: pd.DataFrame = df.copy()
-    alpha: float = 0.7
-    for _ in range(steps):
-        last_row = df_pred.iloc[-1]
-        input_vector = last_row[feature_cols].values.reshape(1, -1)
-        input_scaled = scaler_X.transform(input_vector)
-        model_pred = scaler_y.inverse_transform(model.predict(input_scaled).reshape(-1, 1))[0, 0]
-        pred = alpha * model_pred + (1 - alpha) * last_row["close_clean"]
-        predictions.append(pred)
-        new_row = last_row.copy()
-        new_row["close_clean"] = pred
-        for i in range(lags, 1, -1):
-            new_row[f"lag_{i}"] = last_row.get(f"lag_{i-1}", pred)
-        new_row["lag_1"] = pred
-        new_index = df_pred.index[-1] + pd.Timedelta(minutes=1)
-        new_row.name = new_index
-        df_pred = pd.concat([df_pred, new_row.to_frame().T])
+def adaptive_alpha(model_confidence, market_volatility, horizon):
+    base_alpha = max(0.2, 0.9 - 0.1 * horizon)
+    vol_factor = 1.0 - min(1.0, market_volatility / 0.05)
+    final_alpha = base_alpha * model_confidence * vol_factor
+    return final_alpha
+
+def improved_multivariate_prediction(model, scaler_X, scaler_y, feature_cols, df, steps=5, lags=3):
+    horizon_models = {}
+    horizon_scalers_y = {}
+    try:
+        for h in range(1, min(steps+1, 4)):
+            X_train = []
+            y_train = []
+            for i in range(lags, len(df) - h):
+                features = df.iloc[i][feature_cols].values
+                target = df.iloc[i + h]["close_clean"]
+                X_train.append(features)
+                y_train.append(target)
+            if X_train and y_train:
+                X_train = np.array(X_train)
+                y_train = np.array(y_train).reshape(-1, 1)
+                h_scaler_y = StandardScaler().fit(y_train)
+                y_train_scaled = h_scaler_y.transform(y_train).ravel()
+                h_model = Ridge(alpha=1.0).fit(scaler_X.transform(X_train), y_train_scaled)
+                horizon_models[h] = h_model
+                horizon_scalers_y[h] = h_scaler_y
+    except Exception as e:
+        logging.warning(f"Ошибка при создании многогоризонтных моделей: {e}")
+    predictions = []
+    last_row = df.iloc[-1]
+    current_price = last_row["close_clean"]
+    model_conf = 0.8
+    volatility = df["close_clean"].pct_change().rolling(5).std().iloc[-1]
+    for step in range(1, steps + 1):
+        try:
+            if step in horizon_models:
+                input_vector = last_row[feature_cols].values.reshape(1, -1)
+                input_scaled = scaler_X.transform(input_vector)
+                h_model = horizon_models[step]
+                h_scaler_y = horizon_scalers_y[step]
+                pred_scaled = h_model.predict(input_scaled)
+                model_pred = h_scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0, 0]
+                confidence = max(0.6, 1.0 - 0.1 * step)
+            else:
+                input_vector = last_row[feature_cols].values.reshape(1, -1)
+                input_scaled = scaler_X.transform(input_vector)
+                pred_scaled = model.predict(input_scaled)
+                model_pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1))[0, 0]
+                confidence = max(0.5, 0.9 - 0.1 * step)
+            alpha = adaptive_alpha(model_conf, volatility, step)
+            pred = alpha * model_pred + (1 - alpha) * current_price
+            predictions.append(pred)
+        except Exception as e:
+            logging.warning(f"Ошибка прогнозирования на шаге {step}: {e}")
+            if predictions:
+                last_pred = predictions[-1]
+                if len(predictions) > 1:
+                    trend = (predictions[-1] - predictions[-2])
+                    predictions.append(last_pred + trend)
+                else:
+                    predictions.append(last_pred)
+            else:
+                predictions.append(current_price)
     return predictions
+
+def analyze_volatility(df):
+    recent_vol = df["close_clean"].pct_change().rolling(window=5).std().iloc[-1]
+    hist_vol = df["close_clean"].pct_change().rolling(window=20).std().iloc[-1]
+    recent_returns = df["close_clean"].pct_change().iloc[-5:]
+    recent_mean = recent_returns.mean()
+    abs_mean = abs(recent_mean)
+    directional_ratio = abs_mean / recent_vol if recent_vol > 0 else 0
+    vol_factor = 0
+    vol_note = ""
+    if hist_vol > 0 and recent_vol > 1.8 * hist_vol:
+        if directional_ratio > 0.7:
+            if recent_mean > 0:
+                vol_factor = 2
+                vol_note = "Направленная волатильность (бычья)"
+            else:
+                vol_factor = -2
+                vol_note = "Направленная волатильность (медвежья)"
+        else:
+            vol_factor = -2
+            vol_note = "Высокая хаотичная волатильность"
+    elif hist_vol > 0 and recent_vol < 0.5 * hist_vol:
+        vol_factor = -1
+        vol_note = "Сжатие волатильности (затишье перед бурей)"
+    return vol_factor, vol_note
+
+def is_trending_market(df):
+    returns = df["close_clean"].pct_change().dropna()
+    return returns.rolling(window=10).mean().iloc[-1] > 0 if len(returns) >= 10 else False
+
+def dynamic_rsi_thresholds(df):
+    rsi_history = df["rsi"].dropna()
+    if len(rsi_history) < 30:
+        return 30, 70
+    low_threshold = max(10, rsi_history.quantile(0.1))
+    high_threshold = min(90, rsi_history.quantile(0.9))
+    if is_trending_market(df):
+        low_threshold = max(10, low_threshold - 5)
+        high_threshold = min(90, high_threshold + 5)
+    else:
+        mid_point = (low_threshold + high_threshold) / 2
+        low_threshold = min(30, mid_point - 15)
+        high_threshold = max(70, mid_point + 15)
+    return low_threshold, high_threshold
+
+def analyze_volume_with_price(df, current_price):
+    if "volume" not in df.columns or len(df) < 20:
+        return 0, "Нет данных по объему"
+    recent = df.iloc[-5:]
+    avg_vol = df["volume"].iloc[-20:].mean()
+    if avg_vol == 0:
+        return 0, "Нет объема"
+    up_candles = recent[recent["close"] > recent["open"]]
+    down_candles = recent[recent["close"] < recent["open"]]
+    up_vol = up_candles["volume"].sum() / max(1, len(up_candles))
+    down_vol = down_candles["volume"].sum() / max(1, len(down_candles))
+    last_vol = df["volume"].iloc[-1]
+    last_price_change = df["close"].iloc[-1] - df["open"].iloc[-1]
+    vol_score = 0
+    vol_message = ""
+    if last_vol > 2 * avg_vol:
+        if last_price_change > 0:
+            if up_vol > down_vol * 1.5:
+                vol_score = 3
+                vol_message = "Высокий объем покупок"
+            else:
+                vol_score = 1
+                vol_message = "Повышенный объем при росте цены"
+        else:
+            if down_vol > up_vol * 1.5:
+                vol_score = -3
+                vol_message = "Высокий объем продаж"
+            else:
+                vol_score = -1
+                vol_message = "Повышенный объем при падении цены"
+    elif last_vol < 0.5 * avg_vol:
+        vol_score = -0.5
+        vol_message = "Низкий торговый объем (низкая ликвидность)"
+    price_trend = 1 if df["close"].iloc[-5:].corr(pd.Series(range(5))) > 0.7 else -1 if df["close"].iloc[-5:].corr(pd.Series(range(5))) < -0.7 else 0
+    volume_trend = 1 if df["volume"].iloc[-5:].corr(pd.Series(range(5))) > 0.7 else -1 if df["volume"].iloc[-5:].corr(pd.Series(range(5))) < -0.7 else 0
+    if price_trend == 1 and volume_trend == -1:
+        vol_score -= 2
+        vol_message += " | Дивергенция: рост цены на падающем объеме"
+    elif price_trend == -1 and volume_trend == -1:
+        vol_score += 1
+        vol_message += " | Ослабление нисходящего тренда (падение объема)"
+    return vol_score, vol_message
+
+def analyze_market(ind: Dict[str, float], current_price: float, predictions: List[float], df: pd.DataFrame = None) -> str:
+    weights: Dict[str, float] = {"rsi": 0.3, "macd": 0.3, "ema": 0.2, "stoch": 0.2}
+    score: float = 0
+    factors: List[str] = []
+    if df is not None and len(df) > 20:
+        vol_factor, vol_note = analyze_volatility(df)
+        score += vol_factor
+        factors.append(vol_note)
+    if df is not None and len(df) > 1:
+        last_close = df["close_clean"].iloc[-2]
+        current_open = df["open"].iloc[-1]
+        if abs(current_open - last_close) / last_close > 0.02:
+            if current_open > last_close:
+                score += 3
+                factors.append("Гэп вверх")
+            else:
+                score -= 3
+                factors.append("Гэп вниз")
+    low_rsi, high_rsi = dynamic_rsi_thresholds(df) if df is not None and "rsi" in df.columns else (30, 70)
+    rsi = ind["rsi"]
+    if rsi < low_rsi:
+        rsi_score = weights["rsi"] * (2 * (low_rsi - rsi) / low_rsi)
+        rsi_msg = f"RSI перепродан ({rsi:.1f} < {low_rsi:.1f})"
+    elif rsi > high_rsi:
+        rsi_score = -weights["rsi"] * (2 * (rsi - high_rsi) / (100 - high_rsi))
+        rsi_msg = f"RSI перекуплен ({rsi:.1f} > {high_rsi:.1f})"
+    else:
+        norm_rsi = (rsi - 50) / (high_rsi - low_rsi) * 30
+        rsi_score = -weights["rsi"] * norm_rsi
+        rsi_msg = f"RSI нейтрален ({rsi:.1f})"
+    score += rsi_score
+    factors.append(rsi_msg)
+    macd_diff = ind["macd"] - ind["macd_signal"]
+    score += weights["macd"] * macd_diff
+    ema_trend = 3 if (current_price > ind["ema20"] and ind["ema20"] > ind["ema50"]) else -3 if (current_price < ind["ema20"] and ind["ema20"] < ind["ema50"]) else 0
+    score += weights["ema"] * ema_trend
+    stoch_signal = 2 if ind["stoch"] < 20 else -2 if ind["stoch"] > 80 else 0
+    score += weights["stoch"] * stoch_signal
+    vol_score, vol_message = analyze_volume_with_price(df, current_price) if df is not None else (0, "")
+    score += vol_score
+    if vol_message:
+        factors.append(vol_message)
+    regimes = detect_regime(df) if df is not None else {"0": 0.5, "1": 0.5}
+    bullish_regime = regimes.get("0", 0.5)
+    score += (bullish_regime - 0.5) * 10
+    if score >= 3:
+        signal = "СИГНАЛ к ЛОНГУ"
+    elif score <= -3:
+        signal = "СИГНАЛ к ШОРТУ"
+    else:
+        signal = "РЫНОК НЕЙТРАЛЕН"
+    return f"{signal} (score: {score:.1f}) - {', '.join(factors[:3])}"
 
 def detect_regime(df: pd.DataFrame) -> Dict[str, float]:
     if len(df) < 30:
@@ -359,130 +542,6 @@ def detect_regime(df: pd.DataFrame) -> Dict[str, float]:
     except Exception:
         regimes = {"0": 0.5, "1": 0.5}
     return regimes
-
-def analyze_market(ind: Dict[str, float], current_price: float, predictions: List[float], df: pd.DataFrame = None) -> str:
-    weights: Dict[str, float] = {"rsi": 0.3, "macd": 0.3, "ema": 0.2, "stoch": 0.2}
-    score: float = 0
-    factors: List[str] = []
-    if df is not None and len(df) > 20:
-        recent_vol = df["close_clean"].pct_change().rolling(window=5).std().iloc[-1]
-        hist_vol = df["close_clean"].pct_change().rolling(window=20).std().iloc[-1]
-        if hist_vol > 0 and recent_vol > 2 * hist_vol:
-            score -= 3
-            factors.append("Высокая волатильность")
-    if df is not None and len(df) > 1:
-        last_close = df["close_clean"].iloc[-2]
-        current_open = df["open"].iloc[-1]
-        if abs(current_open - last_close) / last_close > 0.02:
-            if current_open > last_close:
-                score += 3
-                factors.append("Гэп вверх")
-            else:
-                score -= 3
-                factors.append("Гэп вниз")
-    rsi = ind["rsi"]
-    score += weights["rsi"] * ((50 - rsi) / 10)
-    macd_diff = ind["macd"] - ind["macd_signal"]
-    score += weights["macd"] * macd_diff
-    ema_trend = 3 if (current_price > ind["ema20"] and ind["ema20"] > ind["ema50"]) else -3 if (current_price < ind["ema20"] and ind["ema20"] < ind["ema50"]) else 0
-    score += weights["ema"] * ema_trend
-    stoch_signal = 2 if ind["stoch"] < 20 else -2 if ind["stoch"] > 80 else 0
-    score += weights["stoch"] * stoch_signal
-    regimes = detect_regime(df) if df is not None else {"0": 0.5, "1": 0.5}
-    bullish_regime = regimes.get("0", 0.5)
-    score += (bullish_regime - 0.5) * 10
-    if score >= 3:
-        signal = "СИГНАЛ к ЛОНГУ"
-    elif score <= -3:
-        signal = "СИГНАЛ к ШОРТУ"
-    else:
-        signal = "РЫНОК НЕЙТРАЛЕН"
-    return f"{signal} (score: {score:.1f}) - {', '.join(factors[:3])}"
-
-class PredictionTracker:
-    def __init__(self, ticker: str) -> None:
-        self.ticker: str = ticker
-        self.predictions: Dict[str, Dict[str, Any]] = {}
-        self.filename: str = f"{ticker}_predictions.pkl"
-        self.load_history()
-    def load_history(self) -> None:
-        try:
-            if os.path.exists(self.filename):
-                with open(self.filename, "rb") as f:
-                    self.predictions = pickle.load(f)
-        except Exception:
-            self.predictions = {}
-    def save_history(self) -> None:
-        try:
-            with open(self.filename, "wb") as f:
-                pickle.dump(self.predictions, f)
-        except Exception:
-            pass
-    def add_predictions(self, timestamp: datetime, predictions: List[float], intervals: List[int], base_price: float) -> None:
-        ts = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-        self.predictions[ts] = {}
-        for i, pred in enumerate(predictions):
-            if i < len(intervals):
-                interval = intervals[i]
-                self.predictions[ts][str(interval)] = {
-                    "prediction": pred,
-                    "actual": None,
-                    "timestamp": timestamp,
-                    "target_time": timestamp + timedelta(minutes=interval),
-                    "base_price": base_price
-                }
-        self.save_history()
-    def update_actuals(self, current_time: datetime, price: float) -> None:
-        updated = False
-        for ts, intervals in list(self.predictions.items()):
-            for interval, data in list(intervals.items()):
-                if data["actual"] is None and current_time >= data["target_time"]:
-                    self.predictions[ts][interval]["actual"] = price
-                    updated = True
-        one_day_ago = datetime.now() - timedelta(days=1)
-        for ts in list(self.predictions.keys()):
-            timestamp = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-            if timestamp < one_day_ago:
-                del self.predictions[ts]
-                updated = True
-        if updated:
-            self.save_history()
-    def get_accuracy_stats(self) -> Dict[str, Any]:
-        if not self.predictions:
-            return {}
-        completed = []
-        for ts, intervals in self.predictions.items():
-            for interval, data in intervals.items():
-                if data["actual"] is not None:
-                    base_price = data.get("base_price", data["prediction"])
-                    pred_direction = 1 if data["prediction"] > base_price else -1 if data["prediction"] < base_price else 0
-                    actual_direction = 1 if data["actual"] > base_price else -1 if data["actual"] < base_price else 0
-                    direction_correct = pred_direction == actual_direction
-                    error = abs(data["prediction"] - data["actual"]) / data["actual"] * 100
-                    completed.append({
-                        "interval": interval,
-                        "error": error,
-                        "direction_correct": direction_correct
-                    })
-        if not completed:
-            return {}
-        stats: Dict[str, Dict[str, float]] = {}
-        for pred in completed:
-            interval = pred["interval"]
-            if interval not in stats:
-                stats[interval] = {"count": 0, "error_sum": 0, "correct": 0}
-            stats[interval]["count"] += 1
-            stats[interval]["error_sum"] += pred["error"]
-            stats[interval]["correct"] += 1 if pred["direction_correct"] else 0
-        overall_count = sum(s["count"] for s in stats.values())
-        overall_error = sum(s["error_sum"] for s in stats.values())
-        overall_correct = sum(s["correct"] for s in stats.values())
-        return {
-            "total_count": overall_count,
-            "avg_error": overall_error / overall_count if overall_count > 0 else 0,
-            "direction_accuracy": overall_correct / overall_count * 100 if overall_count > 0 else 0,
-            "by_interval": stats
-        }
 
 def clear_terminal() -> None:
     os.system("cls" if os.name == "nt" else "clear")
@@ -670,6 +729,91 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float, pr
     )
     print(report)
 
+class PredictionTracker:
+    def __init__(self, ticker: str) -> None:
+        self.ticker: str = ticker
+        self.predictions: Dict[str, Dict[str, Any]] = {}
+        self.filename: str = f"{ticker}_predictions.pkl"
+        self.load_history()
+    def load_history(self) -> None:
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, "rb") as f:
+                    self.predictions = pickle.load(f)
+        except Exception:
+            self.predictions = {}
+    def save_history(self) -> None:
+        try:
+            with open(self.filename, "wb") as f:
+                pickle.dump(self.predictions, f)
+        except Exception:
+            pass
+    def add_predictions(self, timestamp: datetime, predictions: List[float], intervals: List[int], base_price: float) -> None:
+        ts = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        self.predictions[ts] = {}
+        for i, pred in enumerate(predictions):
+            if i < len(intervals):
+                interval = intervals[i]
+                self.predictions[ts][str(interval)] = {
+                    "prediction": pred,
+                    "actual": None,
+                    "timestamp": timestamp,
+                    "target_time": timestamp + timedelta(minutes=interval),
+                    "base_price": base_price
+                }
+        self.save_history()
+    def update_actuals(self, current_time: datetime, price: float) -> None:
+        updated = False
+        for ts, intervals in list(self.predictions.items()):
+            for interval, data in list(intervals.items()):
+                if data["actual"] is None and current_time >= data["target_time"]:
+                    self.predictions[ts][interval]["actual"] = price
+                    updated = True
+        one_day_ago = datetime.now() - timedelta(days=1)
+        for ts in list(self.predictions.keys()):
+            timestamp = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            if timestamp < one_day_ago:
+                del self.predictions[ts]
+                updated = True
+        if updated:
+            self.save_history()
+    def get_accuracy_stats(self) -> Dict[str, Any]:
+        if not self.predictions:
+            return {}
+        completed = []
+        for ts, intervals in self.predictions.items():
+            for interval, data in intervals.items():
+                if data["actual"] is not None:
+                    base_price = data.get("base_price", data["prediction"])
+                    pred_direction = 1 if data["prediction"] > base_price else -1 if data["prediction"] < base_price else 0
+                    actual_direction = 1 if data["actual"] > base_price else -1 if data["actual"] < base_price else 0
+                    direction_correct = pred_direction == actual_direction
+                    error = abs(data["prediction"] - data["actual"]) / data["actual"] * 100
+                    completed.append({
+                        "interval": interval,
+                        "error": error,
+                        "direction_correct": direction_correct
+                    })
+        if not completed:
+            return {}
+        stats: Dict[str, Dict[str, float]] = {}
+        for pred in completed:
+            interval = pred["interval"]
+            if interval not in stats:
+                stats[interval] = {"count": 0, "error_sum": 0, "correct": 0}
+            stats[interval]["count"] += 1
+            stats[interval]["error_sum"] += pred["error"]
+            stats[interval]["correct"] += 1 if pred["direction_correct"] else 0
+        overall_count = sum(s["count"] for s in stats.values())
+        overall_error = sum(s["error_sum"] for s in stats.values())
+        overall_correct = sum(s["correct"] for s in stats.values())
+        return {
+            "total_count": overall_count,
+            "avg_error": overall_error / overall_count if overall_count > 0 else 0,
+            "direction_accuracy": overall_correct / overall_count * 100 if overall_count > 0 else 0,
+            "by_interval": stats
+        }
+
 async def main() -> None:
     ticker: str = input("Введите тикер: ")
     try:
@@ -722,7 +866,7 @@ async def main() -> None:
                 df = preprocess_data(df)
                 df = calculate_indicators(df)
                 model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features = train_model_enhanced(df, lags=3)
-                predictions = predict_multiple_steps_enhanced(model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features, steps=5, lags=3)
+                predictions = improved_multivariate_prediction(model_cache, scaler_X_cache, scaler_y_cache, feature_cols_cache, df_features, steps=5, lags=3)
                 df_cache = df
                 df_features_cache = df_features
                 predictions_cache = predictions
