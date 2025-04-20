@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import pandas as pd
@@ -587,18 +588,57 @@ def is_trending_market(df):
 
 
 def dynamic_rsi_thresholds(df):
+    if df is None or "rsi" not in df.columns:
+        return 30, 70
+    
     rsi_history = df["rsi"].dropna()
     if len(rsi_history) < 30:
         return 30, 70
+    
     low_threshold = max(10, rsi_history.quantile(0.1))
     high_threshold = min(90, rsi_history.quantile(0.9))
-    if is_trending_market(df):
-        low_threshold = max(10, low_threshold - 5)
-        high_threshold = min(90, high_threshold + 5)
+    
+    recent_volatility = df["close"].pct_change().rolling(5).std().iloc[-5:].mean() * 100
+    historical_volatility = df["close"].pct_change().rolling(20).std().iloc[-20:].mean() * 100
+    vol_ratio = recent_volatility / historical_volatility if historical_volatility > 0 else 1.0
+    
+    recent_price_change = df["close"].iloc[-5:].pct_change(5).iloc[-1] * 100
+    
+    is_trend = is_trending_market(df)
+    
+    trend_strength = 0
+    if abs(recent_price_change) > 3:
+        trend_strength = 1 if recent_price_change > 0 else -1
+    
+    recent_rsi = rsi_history.iloc[-10:]
+    rsi_trend = np.polyfit(range(len(recent_rsi)), recent_rsi, 1)[0]
+    
+    if is_trend:
+        if trend_strength > 0:
+            low_threshold = max(20, low_threshold)
+            high_threshold = min(85, high_threshold + 5)
+        elif trend_strength < 0:
+            low_threshold = max(15, low_threshold - 5)
+            high_threshold = min(80, high_threshold)
     else:
         mid_point = (low_threshold + high_threshold) / 2
-        low_threshold = min(30, mid_point - 15)
-        high_threshold = max(70, mid_point + 15)
+        range_factor = 0.8 if vol_ratio < 1.5 else 1.0
+        low_threshold = max(25, mid_point - (mid_point - low_threshold) * range_factor)
+        high_threshold = min(75, mid_point + (high_threshold - mid_point) * range_factor)
+    
+    if vol_ratio > 2.0:
+        low_threshold = max(15, low_threshold - 5)
+        high_threshold = min(85, high_threshold + 5)
+    
+    if abs(rsi_trend) > 3:
+        if rsi_trend > 0:
+            high_threshold = max(70, min(90, high_threshold + 3))
+        else:
+            low_threshold = max(10, min(30, low_threshold - 3))
+    
+    low_threshold = round(low_threshold, 1)
+    high_threshold = round(high_threshold, 1)
+    
     return low_threshold, high_threshold
 
 
@@ -651,18 +691,15 @@ def analyze_volume_with_price(df, current_price):
 
 
 def calculate_market_health_index(df: pd.DataFrame) -> Tuple[float, str]:
-    """
-    Рассчитывает индекс здоровья рынка на основе множества метрик
-    """
     if df is None or len(df) < 30:
         return 50.0, "Недостаточно данных"
     
-    # Базовые метрики
     rsi = df["rsi"].iloc[-1]
     close = df["close_clean"].iloc[-1]
     vol_ratio = df["volume"].iloc[-1] / df["vol_ma20"].iloc[-1] if df["vol_ma20"].iloc[-1] > 0 else 1.0
     
-    # 1. Тренд
+    asset_class = detect_asset_class(df)
+    
     price_trend = 0
     sma20 = df["sma20"].iloc[-1]
     ema50 = df["ema50"].iloc[-1]
@@ -671,44 +708,77 @@ def calculate_market_health_index(df: pd.DataFrame) -> Tuple[float, str]:
     elif close < sma20 and sma20 < ema50:
         price_trend = -10
     else:
-        # Считаем наклон EMA20 за последние 5 свечей
         ema_slope = df["ema20"].iloc[-5:].diff().mean()
-        price_trend = min(10, max(-10, ema_slope * 100))
+        slope_factor = 100
+        if asset_class == "forex":
+            slope_factor = 5000
+        elif asset_class == "crypto":
+            slope_factor = 50
+        
+        price_trend = min(10, max(-10, ema_slope * slope_factor))
     
-    # 2. Моментум
     momentum = 0
-    if 30 <= rsi <= 70:
-        momentum = 10 * (rsi - 50) / 20  # нормализация в диапазоне -10 до 10
-    elif rsi < 30:
-        momentum = -10 + (rsi / 3)  # -10 до 0
-    else:  # rsi > 70
-        momentum = 10 - ((rsi - 70) / 3)  # 0 до 10
+    low_rsi, high_rsi = 30, 70
     
-    # 3. Волатильность (нормализованная)
+    if asset_class == "crypto":
+        low_rsi, high_rsi = 40, 60
+    elif asset_class == "forex":
+        low_rsi, high_rsi = 25, 75
+    
+    if asset_class == "stock":
+        regimes = detect_regime(df)
+        if regimes.get("2", 0) > 0.6:
+            low_rsi -= 5
+            high_rsi -= 5
+        elif regimes.get("0", 0) > 0.6:
+            low_rsi += 5
+            high_rsi += 5
+    
+    if low_rsi <= rsi <= high_rsi:
+        momentum = 10 * (rsi - ((high_rsi + low_rsi) / 2)) / ((high_rsi - low_rsi) / 2)
+    elif rsi < low_rsi:
+        momentum = -10 + (rsi / (low_rsi / 10))
+    else:
+        momentum = 10 - ((rsi - high_rsi) / ((100 - high_rsi) / 10))
+    
     volatility_score = 0
     volatility_5d = df["close_clean"].pct_change().rolling(5).std().iloc[-1] * 100
-    if 0.5 <= volatility_5d <= 2.0:
-        volatility_score = 10  # здоровая волатильность
-    elif volatility_5d < 0.5:
-        volatility_score = max(0, 10 * (volatility_5d / 0.5))  # слишком низкая - плохо
-    else:  # > 2.0
-        volatility_score = max(0, 10 - min(10, (volatility_5d - 2.0) * 2))  # слишком высокая - плохо
     
-    # 4. Объем
+    low_vol, normal_vol, high_vol = 0.5, 2.0, 4.0
+    
+    if asset_class == "crypto":
+        low_vol, normal_vol, high_vol = 2.0, 5.0, 10.0
+    elif asset_class == "forex":
+        low_vol, normal_vol, high_vol = 0.2, 0.8, 1.5
+    
+    if low_vol <= volatility_5d <= normal_vol:
+        volatility_score = 10
+    elif volatility_5d < low_vol:
+        volatility_score = max(0, 10 * (volatility_5d / low_vol))
+    else:
+        decay_factor = 1.0 if asset_class != "crypto" else 0.5
+        volatility_score = max(0, 10 - min(10, (volatility_5d - normal_vol) * decay_factor))
+    
     volume_score = 0
-    if 0.8 <= vol_ratio <= 1.5:
-        volume_score = 10  # здоровый объем
-    elif vol_ratio < 0.8:
-        volume_score = max(0, 10 * (vol_ratio / 0.8))  # низкий объем - плохо
-    else:  # > 1.5
-        # Анализируем, совпадает ли направление объема с ценой
+    
+    low_vol_ratio, high_vol_ratio = 0.8, 1.5
+    
+    if asset_class == "crypto":
+        low_vol_ratio, high_vol_ratio = 0.6, 2.0
+    elif asset_class == "forex":
+        low_vol_ratio, high_vol_ratio = 0.7, 1.3
+    
+    if low_vol_ratio <= vol_ratio <= high_vol_ratio:
+        volume_score = 10
+    elif vol_ratio < low_vol_ratio:
+        volume_score = max(0, 10 * (vol_ratio / low_vol_ratio))
+    else:
         price_up = df["close_clean"].iloc[-1] > df["open"].iloc[-1]
         if (price_up and vol_ratio > 2.0) or (not price_up and vol_ratio < 2.0):
-            volume_score = 8  # соответствие тренду - хорошо
+            volume_score = 8
         else:
-            volume_score = 5  # несоответствие - насторожиться
+            volume_score = 5
     
-    # 5. Взаимодействие с полосами Боллинджера
     bb_score = 0
     bb_upper = df["bb_upper"].iloc[-1]
     bb_lower = df["bb_lower"].iloc[-1]
@@ -716,30 +786,28 @@ def calculate_market_health_index(df: pd.DataFrame) -> Tuple[float, str]:
     
     bb_position = (close - bb_lower) / (bb_upper - bb_lower) if (bb_upper - bb_lower) > 0 else 0.5
     
-    if bb_width < 0.02:  # очень узкие полосы
-        bb_score = 0  # обычно предвещает резкое движение, но направление неясно
+    narrow_bb = 0.02
+    if asset_class == "crypto":
+        narrow_bb = 0.04
+    elif asset_class == "forex":
+        narrow_bb = 0.01
+    
+    if bb_width < narrow_bb:
+        bb_score = 0
     elif 0.1 <= bb_position <= 0.9:
-        bb_score = 10  # здоровое положение внутри полос
+        bb_score = 10
     elif bb_position < 0.1:
-        bb_score = 5  # возможная перепроданность
-    else:  # > 0.9
-        bb_score = 5  # возможная перекупленность
+        bb_score = 5
+    else:
+        bb_score = 5
     
-    # Комбинируем все метрики в единый индекс здоровья
-    weights = {
-        "trend": 0.25,
-        "momentum": 0.2,
-        "volatility": 0.15,
-        "volume": 0.2,
-        "bollinger": 0.2
-    }
+    weights = get_adaptive_weights(asset_class, df)
     
-    # Нормализуем каждую компоненту от 0 до 100 и вычисляем взвешенную сумму
-    normalized_trend = (price_trend + 10) * 5  # -10...10 -> 0...100
-    normalized_momentum = (momentum + 10) * 5  # -10...10 -> 0...100
-    normalized_volatility = volatility_score * 10  # 0...10 -> 0...100
-    normalized_volume = volume_score * 10  # 0...10 -> 0...100
-    normalized_bb = bb_score * 10  # 0...10 -> 0...100
+    normalized_trend = (price_trend + 10) * 5
+    normalized_momentum = (momentum + 10) * 5
+    normalized_volatility = volatility_score * 10
+    normalized_volume = volume_score * 10
+    normalized_bb = bb_score * 10
     
     health_index = (weights["trend"] * normalized_trend +
                    weights["momentum"] * normalized_momentum +
@@ -747,7 +815,6 @@ def calculate_market_health_index(df: pd.DataFrame) -> Tuple[float, str]:
                    weights["volume"] * normalized_volume +
                    weights["bollinger"] * normalized_bb)
     
-    # Определяем состояние рынка на основе индекса здоровья
     if health_index >= 70:
         status = "Сильный рынок"
     elif health_index >= 55:
@@ -761,63 +828,142 @@ def calculate_market_health_index(df: pd.DataFrame) -> Tuple[float, str]:
     
     return health_index, status
 
+
+def detect_asset_class(df: pd.DataFrame) -> str:
+    if df is None or len(df) < 30:
+        return "stock"
+    
+    avg_price = df["close"].mean()
+    volatility = df["close"].pct_change().std() * 100
+    
+    if volatility > 5.0:
+        return "crypto"
+    
+    if volatility < 0.5 and (0.5 < avg_price < 2.0 or 100 < avg_price < 200):
+        return "forex"
+    
+    return "stock"
+
+
+def get_adaptive_weights(asset_class: str, df: pd.DataFrame) -> Dict[str, float]:
+    weights = {
+        "trend": 0.25,
+        "momentum": 0.2,
+        "volatility": 0.15,
+        "volume": 0.2,
+        "bollinger": 0.2
+    }
+    
+    if asset_class == "crypto":
+        weights = {
+            "trend": 0.2,
+            "momentum": 0.25,
+            "volatility": 0.15,
+            "volume": 0.25,
+            "bollinger": 0.15
+        }
+    elif asset_class == "forex":
+        weights = {
+            "trend": 0.3,
+            "momentum": 0.2,
+            "volatility": 0.1,
+            "volume": 0.15,
+            "bollinger": 0.25
+        }
+    
+    if df is not None and len(df) > 30:
+        volatility = df["close"].pct_change().rolling(20).std().iloc[-1] * 100
+        
+        if volatility > 3.0:
+            factor = min(0.1, (volatility - 3.0) / 10.0)
+            weights["volatility"] += factor
+            weights["volume"] += factor
+            weights["trend"] -= factor
+            weights["bollinger"] -= factor
+        
+        elif volatility < 1.0:
+            factor = min(0.1, (1.0 - volatility) / 5.0)
+            weights["trend"] += factor
+            weights["bollinger"] += factor
+            weights["volatility"] -= factor / 2
+            weights["volume"] -= factor / 2
+    
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
 def analyze_complex_volume_patterns(df: pd.DataFrame) -> Tuple[float, str]:
-    """
-    Расширенный анализ объемных паттернов
-    """
     if df is None or len(df) < 20:
         return 0, "Недостаточно данных для анализа объема"
     
-    # Получаем последние N свечей для анализа
     recent = df.iloc[-10:]
     
-    # Определяем базовые метрики объема
     avg_vol_20 = df["volume"].iloc[-20:].mean()
     if avg_vol_20 == 0:
         return 0, "Нет объема"
     
-    # Считаем объемы для бычьих/медвежьих свечей
     up_candles = recent[recent["close"] > recent["open"]]
     down_candles = recent[recent["close"] < recent["open"]]
     up_vol = up_candles["volume"].sum() / max(1, len(up_candles))
     down_vol = down_candles["volume"].sum() / max(1, len(down_candles))
     
-    # Анализируем последние 5 свечей для выявления паттернов
     last_5 = df.iloc[-5:]
     volumes = last_5["volume"].values
     closes = last_5["close"].values
     opens = last_5["open"].values
     
-    # 1. Паттерн затухающего объема
     vol_trend = np.polyfit(range(len(volumes)), volumes, 1)[0]
     price_trend = np.polyfit(range(len(closes)), closes, 1)[0]
     
-    # 2. Паттерн "гвоздь объема" (резкий скачок объема)
     max_vol_idx = np.argmax(volumes)
     max_vol_ratio = volumes[max_vol_idx] / avg_vol_20
     
-    # 3. Паттерн "истощение объема"
-    # Сильное движение с постепенным снижением объема
     price_range = (max(closes) - min(closes)) / min(closes) * 100
     
-    # 4. V-образный разворот объема
     vol_v_shape = False
     price_v_shape = False
     
     if len(volumes) >= 5:
-        # Проверяем форму объемов
         if (volumes[0] > volumes[1] > volumes[2] and volumes[2] < volumes[3] < volumes[4]):
             vol_v_shape = True
         
-        # Проверяем форму цены
         if (closes[0] > closes[1] > closes[2] and closes[2] < closes[3] < closes[4]):
             price_v_shape = True
     
-    # Формируем оценку и сообщение на основе обнаруженных паттернов
+    liquidity_score = 0
+    liquidity_message = ""
+    
+    vol_stability = 1.0 - min(1.0, df["volume"].iloc[-20:].std() / (avg_vol_20 + 1e-10))
+    
+    daily_volume = avg_vol_20 * 24
+    
+    avg_spread_pct = np.mean((df["high"].iloc[-20:] - df["low"].iloc[-20:]) / df["close"].iloc[-20:]) * 100
+    
+    vol_price_ratio = avg_vol_20 / df["close"].iloc[-1]
+    
+    if daily_volume < 1000 or vol_stability < 0.3 or avg_spread_pct > 3.0:
+        liquidity_score = -3
+        liquidity_message = "Низкая ликвидность: возможны ложные сигналы"
+    elif daily_volume < 10000 or vol_stability < 0.5 or avg_spread_pct > 1.0:
+        liquidity_score = -1
+        liquidity_message = "Умеренная ликвидность: требуется осторожность"
+    else:
+        liquidity_score = 1
+        liquidity_message = "Хорошая ликвидность инструмента"
+    
+    recent_vol_ratio = df["volume"].iloc[-5:].mean() / avg_vol_20
+    if recent_vol_ratio < 0.5:
+        liquidity_score -= 1
+        liquidity_message = "Снижение ликвидности в последних сессиях"
+    
     volume_score = 0
     messages = []
     
-    # Смотрим на дивергенцию объема и цены
+    messages.append(liquidity_message)
+    volume_score += liquidity_score
+    
     if vol_trend < 0 and price_trend > 0:
         volume_score -= 3
         messages.append("Дивергенция: рост цены при падающем объеме")
@@ -831,7 +977,6 @@ def analyze_complex_volume_patterns(df: pd.DataFrame) -> Tuple[float, str]:
         volume_score -= 2
         messages.append("Усиление медвежьего тренда (рост объема)")
     
-    # Анализ гвоздя объема
     if max_vol_ratio > 3:
         candle_bullish = closes[max_vol_idx] > opens[max_vol_idx]
         if candle_bullish:
@@ -841,17 +986,14 @@ def analyze_complex_volume_patterns(df: pd.DataFrame) -> Tuple[float, str]:
             volume_score -= 2
             messages.append(f"Сильный объемный всплеск на медвежьей свече ({max_vol_ratio:.1f}x)")
     
-    # V-образный разворот
     if vol_v_shape and price_v_shape:
         volume_score += 3
         messages.append("V-образный разворот с объемным подтверждением")
     
-    # Паттерн истощения
     if price_range > 5 and vol_trend < 0:
         volume_score -= 1
         messages.append(f"Истощение тренда: движение {price_range:.1f}% с падающим объемом")
     
-    # Соотношение объемов на бычьих/медвежьих свечах
     if len(up_candles) > 0 and len(down_candles) > 0:
         up_down_ratio = up_vol / down_vol if down_vol > 0 else 999
         if up_down_ratio > 2:
@@ -861,11 +1003,88 @@ def analyze_complex_volume_patterns(df: pd.DataFrame) -> Tuple[float, str]:
             volume_score -= 2
             messages.append(f"Медвежий объемный перевес: в {1/up_down_ratio:.1f}x больше объема на падении")
     
-    # Формируем итоговое сообщение
-    if not messages:
+    if len(messages) <= 1:
         messages.append("Нет явных объемных паттернов")
     
     return volume_score, " | ".join(messages[:2])
+
+def detect_potential_bounce(df: pd.DataFrame, indicators: Dict[str, float], is_short_signal: bool) -> Tuple[bool, str, float]:
+    if df is None or len(df) < 10:
+        return False, "", 0
+    
+    recent = df.iloc[-5:]
+    bounce_probability = 0
+    reasons = []
+    
+    rsi = indicators["rsi"]
+    if is_short_signal and rsi < 30:
+        bounce_probability += 3
+        reasons.append(f"RSI перепродан ({rsi:.1f})")
+    elif not is_short_signal and rsi > 70:
+        bounce_probability += 3
+        reasons.append(f"RSI перекуплен ({rsi:.1f})")
+    
+    price = recent["close"].iloc[-1]
+    bb_upper = indicators["bb_upper"]
+    bb_lower = indicators["bb_lower"]
+    
+    bb_position = (price - bb_lower) / (bb_upper - bb_lower) if (bb_upper - bb_lower) > 0 else 0.5
+    
+    if is_short_signal and bb_position < 0.1:
+        bounce_probability += 3
+        reasons.append("Цена у нижней полосы Боллинджера")
+    elif not is_short_signal and bb_position > 0.9:
+        bounce_probability += 3
+        reasons.append("Цена у верхней полосы Боллинджера")
+    
+    closes = recent["close"].values
+    opens = recent["open"].values
+    highs = recent["high"].values
+    lows = recent["low"].values
+    
+    if is_short_signal and len(lows) > 0 and len(closes) > 0 and len(opens) > 0:
+        last_candle_body = abs(closes[-1] - opens[-1])
+        last_candle_shadow = min(opens[-1], closes[-1]) - lows[-1]
+        
+        if last_candle_shadow > 2 * last_candle_body and last_candle_body > 0:
+            bounce_probability += 2
+            reasons.append("Свечной паттерн 'молот'")
+    
+    if not is_short_signal and len(highs) > 0 and len(closes) > 0 and len(opens) > 0:
+        last_candle_body = abs(closes[-1] - opens[-1])
+        last_candle_shadow = highs[-1] - max(opens[-1], closes[-1])
+        
+        if last_candle_shadow > 2 * last_candle_body and last_candle_body > 0:
+            bounce_probability += 2
+            reasons.append("Свечной паттерн 'падающая звезда'")
+    
+    if len(df) >= 10:
+        price_change = df["close"].iloc[-5:].pct_change(5).iloc[-1]
+        rsi_change = df["rsi"].iloc[-5:].diff(5).iloc[-1] / 50
+        
+        if is_short_signal and price_change < 0 and rsi_change > 0:
+            bounce_probability += 3
+            reasons.append("Бычья дивергенция RSI")
+        elif not is_short_signal and price_change > 0 and rsi_change < 0:
+            bounce_probability += 3
+            reasons.append("Медвежья дивергенция RSI")
+    
+    if len(df) >= 10:
+        price_deviation = (df["close"].iloc[-1] - df["sma20"].iloc[-1]) / df["sma20"].iloc[-1] * 100
+        
+        if is_short_signal and price_deviation < -10:
+            bounce_probability += 2
+            reasons.append(f"Сильное отклонение от SMA20 ({price_deviation:.1f}%)")
+        elif not is_short_signal and price_deviation > 10:
+            bounce_probability += 2
+            reasons.append(f"Сильное отклонение от SMA20 ({price_deviation:.1f}%)")
+    
+    bounce_probability = min(10, bounce_probability)
+    
+    is_bounce_likely = bounce_probability >= 5
+    reason_text = ", ".join(reasons[:2]) if reasons else "Нет явных признаков отскока"
+    
+    return is_bounce_likely, reason_text, bounce_probability
 
 def analyze_market(ind: Dict[str, float],
                    current_price: float,
@@ -876,34 +1095,60 @@ def analyze_market(ind: Dict[str, float],
         "macd": 0.25,
         "ema": 0.2,
         "stoch": 0.15,
-        "health": 0.15  # Новый вес для индекса здоровья рынка
+        "health": 0.15
     }
     score: float = 0
     factors: List[str] = []
+    market_description: List[str] = []
     
-    # Рассчитываем индекс здоровья рынка
     health_index, health_status = calculate_market_health_index(df) if df is not None else (50.0, "Нет данных")
     
-    # Добавляем влияние индекса здоровья на итоговую оценку
-    health_contribution = (health_index - 50) / 10  # Нормализуем вклад
+    health_contribution = (health_index - 50) / 10
     score += weights["health"] * health_contribution
     factors.append(f"Индекс здоровья: {health_index:.1f} ({health_status})")
+    
+    if health_index >= 70:
+        market_description.append("Рынок в сильном состоянии с преобладающими бычьими тенденциями. Наблюдается высокая вероятность продолжения роста.")
+    elif health_index >= 60:
+        market_description.append("Рынок здоровый, с позитивным настроем. Покупатели контролируют ситуацию, падения могут быть хорошими точками для входа в длинные позиции.")
+    elif health_index >= 50:
+        market_description.append("Рынок в нейтрально-позитивном состоянии. Возможны движения в обоих направлениях, но с небольшим преимуществом покупателей.")
+    elif health_index >= 40:
+        market_description.append("Рынок в нейтрально-негативном состоянии. Покупатели и продавцы находятся в противостоянии, с небольшим преимуществом продавцов.")
+    elif health_index >= 30:
+        market_description.append("Рынок ослаблен, преобладают медвежьи настроения. Рискованно открывать длинные позиции без явных признаков разворота.")
+    else:
+        market_description.append("Рынок в слабом состоянии, сильное медвежье давление. Возможны краткосрочные отскоки на перепроданности, но основной тренд остается нисходящим.")
     
     if df is not None and len(df) > 20:
         vol_factor, vol_note = analyze_volatility(df)
         score += vol_factor
         factors.append(vol_note)
+        
+        recent_vol = df["close_clean"].pct_change().rolling(window=5).std().iloc[-1] * 100
+        hist_vol = df["close_clean"].pct_change().rolling(window=20).std().iloc[-1] * 100
+        
+        if recent_vol > 1.8 * hist_vol:
+            market_description.append(f"Волатильность резко повысилась (текущая: {recent_vol:.2f}%, историческая: {hist_vol:.2f}%). Это может указывать на смену тренда или начало импульсного движения.")
+        elif recent_vol < 0.5 * hist_vol:
+            market_description.append(f"Волатильность необычно низкая (текущая: {recent_vol:.2f}%, историческая: {hist_vol:.2f}%). Возможно, рынок готовится к резкому движению ('затишье перед бурей').")
+        else:
+            market_description.append(f"Волатильность в пределах нормы (текущая: {recent_vol:.2f}%, историческая: {hist_vol:.2f}%).")
     
     if df is not None and len(df) > 1:
         last_close = df["close_clean"].iloc[-2]
         current_open = df["open"].iloc[-1]
-        if abs(current_open - last_close) / last_close > 0.02:
+        gap_percent = (current_open - last_close) / last_close * 100
+        
+        if abs(gap_percent) > 2:
             if current_open > last_close:
                 score += 3
                 factors.append("Гэп вверх")
+                market_description.append(f"Обнаружен значительный гэп вверх ({gap_percent:.2f}%). Это может указывать на сильное бычье давление или реакцию на позитивные новости.")
             else:
                 score -= 3
                 factors.append("Гэп вниз")
+                market_description.append(f"Обнаружен значительный гэп вниз ({gap_percent:.2f}%). Это может указывать на сильное медвежье давление или реакцию на негативные новости.")
     
     low_rsi, high_rsi = dynamic_rsi_thresholds(
         df) if df is not None and "rsi" in df.columns else (30, 70)
@@ -911,37 +1156,103 @@ def analyze_market(ind: Dict[str, float],
     if rsi < low_rsi:
         rsi_score = weights["rsi"] * (2 * (low_rsi - rsi) / low_rsi)
         rsi_msg = f"RSI перепродан ({rsi:.1f} < {low_rsi:.1f})"
+        market_description.append(f"RSI в зоне перепроданности ({rsi:.1f}), что может указывать на истощение продавцов и возможный отскок цены вверх.")
     elif rsi > high_rsi:
         rsi_score = -weights["rsi"] * (2 * (rsi - high_rsi) / (100 - high_rsi))
         rsi_msg = f"RSI перекуплен ({rsi:.1f} > {high_rsi:.1f})"
+        market_description.append(f"RSI в зоне перекупленности ({rsi:.1f}), что может указывать на истощение покупателей и возможную коррекцию цены вниз.")
     else:
         norm_rsi = (rsi - 50) / (high_rsi - low_rsi) * 30
         rsi_score = -weights["rsi"] * norm_rsi
         rsi_msg = f"RSI нейтрален ({rsi:.1f})"
+        
+        if df is not None and len(df) > 5:
+            rsi_slope = df["rsi"].iloc[-5:].diff().mean()
+            if rsi_slope > 2:
+                market_description.append(f"RSI в нейтральной зоне ({rsi:.1f}), но наблюдается уверенный рост индикатора, что указывает на усиление покупателей.")
+            elif rsi_slope < -2:
+                market_description.append(f"RSI в нейтральной зоне ({rsi:.1f}), но наблюдается уверенное снижение индикатора, что указывает на усиление продавцов.")
+            else:
+                market_description.append(f"RSI в нейтральной зоне ({rsi:.1f}) без выраженной динамики.")
+    
     score += rsi_score
     factors.append(rsi_msg)
     
     macd_diff = ind["macd"] - ind["macd_signal"]
     score += weights["macd"] * macd_diff
     
-    ema_trend = 3 if (current_price > ind["ema20"]
-                      and ind["ema20"] > ind["ema50"]) else -3 if (
-                          current_price < ind["ema20"]
-                          and ind["ema20"] < ind["ema50"]) else 0
+    if macd_diff > 0.05:
+        market_description.append(f"MACD выше сигнальной линии (разница: {macd_diff:.3f}). Индикатор подтверждает бычий импульс.")
+    elif macd_diff < -0.05:
+        market_description.append(f"MACD ниже сигнальной линии (разница: {macd_diff:.3f}). Индикатор подтверждает медвежий импульс.")
+    else:
+        market_description.append(f"MACD около сигнальной линии (разница: {macd_diff:.3f}). Возможно формирование нового тренда или продолжение флэта.")
+    
+    ema_trend = 3 if (current_price > ind["ema20"] and ind["ema20"] > ind["ema50"]) else -3 if (current_price < ind["ema20"] and ind["ema20"] < ind["ema50"]) else 0
     score += weights["ema"] * ema_trend
+    
+    if ema_trend > 0:
+        market_description.append("Цена выше EMA20 и EMA50, что подтверждает восходящий тренд. Скользящие средние выстроены в бычьем порядке.")
+    elif ema_trend < 0:
+        market_description.append("Цена ниже EMA20 и EMA50, что подтверждает нисходящий тренд. Скользящие средние выстроены в медвежьем порядке.")
+    else:
+        if abs(ind["ema20"] - ind["ema50"]) / ind["ema50"] < 0.005:
+            market_description.append("EMA20 и EMA50 находятся близко друг к другу. Возможно скорое формирование нового тренда.")
+        else:
+            market_description.append("Неоднозначное положение цены относительно EMA20 и EMA50. Тренд может быть в процессе смены направления.")
     
     stoch_signal = 2 if ind["stoch"] < 20 else -2 if ind["stoch"] > 80 else 0
     score += weights["stoch"] * stoch_signal
     
-    # Используем расширенный анализ объемных паттернов
+    if ind["stoch"] < 20:
+        market_description.append(f"Стохастик в зоне перепроданности ({ind['stoch']:.1f}), что может сигнализировать о возможном отскоке цены вверх.")
+    elif ind["stoch"] > 80:
+        market_description.append(f"Стохастик в зоне перекупленности ({ind['stoch']:.1f}), что может сигнализировать о возможной коррекции цены вниз.")
+    else:
+        market_description.append(f"Стохастик в нейтральной зоне ({ind['stoch']:.1f}).")
+    
     vol_score, vol_message = analyze_complex_volume_patterns(df) if df is not None else (0, "")
     score += vol_score
     if vol_message:
         factors.append(vol_message)
+        market_description.append(f"Анализ объемов: {vol_message}")
     
     regimes = detect_regime(df) if df is not None else {"0": 0.5, "1": 0.5}
     bullish_regime = regimes.get("0", 0.5)
+    bearish_regime = regimes.get("2", 0.0)
+    neutral_regime = regimes.get("1", 0.0)
     score += (bullish_regime - 0.5) * 10
+    
+    if bullish_regime > 0.6:
+        market_description.append(f"Рынок находится преимущественно в бычьем режиме (вероятность: {bullish_regime*100:.1f}%). Фаза роста, благоприятная для длинных позиций.")
+    elif bearish_regime > 0.6:
+        market_description.append(f"Рынок находится преимущественно в медвежьем режиме (вероятность: {bearish_regime*100:.1f}%). Фаза снижения, благоприятная для коротких позиций.")
+    elif neutral_regime > 0.6:
+        market_description.append(f"Рынок находится преимущественно в нейтральном режиме (вероятность: {neutral_regime*100:.1f}%). Боковое движение в диапазоне.")
+    else:
+        market_description.append(f"Смешанный режим рынка с элементами бычьего ({bullish_regime*100:.1f}%), медвежьего ({bearish_regime*100:.1f}%) и нейтрального ({neutral_regime*100:.1f}%) поведения.")
+    
+    if predictions and len(predictions) > 1:
+        pred_change = (predictions[-1] - current_price) / current_price * 100
+        pred_direction = "рост" if pred_change > 0 else "снижение" if pred_change < 0 else "стабильность"
+        market_description.append(f"Прогноз модели указывает на {pred_direction} цены на {abs(pred_change):.2f}% в ближайшее время.")
+    
+    is_long_signal = score >= 3
+    is_short_signal = score <= -3
+    
+    if is_long_signal or is_short_signal:
+        bounce_likely, bounce_reason, bounce_strength = detect_potential_bounce(
+            df, ind, is_short_signal)
+        
+        if bounce_likely:
+            if is_short_signal:
+                score = max(-2.9, score + bounce_strength * 0.3)
+                factors.insert(0, f"⚠️ Возможен отскок вверх ({bounce_reason})")
+                market_description.append(f"⚠️ Несмотря на общий медвежий сигнал, обнаружены признаки возможного отскока вверх: {bounce_reason}")
+            elif is_long_signal:
+                score = min(2.9, score - bounce_strength * 0.3)
+                factors.insert(0, f"⚠️ Возможен отскок вниз ({bounce_reason})")
+                market_description.append(f"⚠️ Несмотря на общий бычий сигнал, обнаружены признаки возможного отскока вниз: {bounce_reason}")
     
     if score >= 3:
         signal = "СИГНАЛ к ЛОНГУ"
@@ -950,7 +1261,10 @@ def analyze_market(ind: Dict[str, float],
     else:
         signal = "РЫНОК НЕЙТРАЛЕН"
     
-    return f"{signal} (score: {score:.1f}) - {', '.join(factors[:3])}"
+    signal_line = f"{signal} (score: {score:.1f}) - {', '.join(factors[:3])}"
+    market_state = "\n".join([f"• {desc}" for desc in market_description])
+    
+    return f"{signal_line}\n\nДЕТАЛЬНЫЙ АНАЛИЗ РЫНКА:\n{market_state}"
 
 
 def detect_regime(df: pd.DataFrame) -> Dict[str, float]:
@@ -1122,12 +1436,34 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
     CYAN = Fore.CYAN + Style.BRIGHT
     MAGENTA = Fore.MAGENTA + Style.BRIGHT
     WHITE = Fore.WHITE + Style.BRIGHT
+    BLUE = Fore.BLUE + Style.BRIGHT
     
-    # Рассчитываем индекс здоровья рынка для вывода
     health_index, health_status = calculate_market_health_index(df) if df is not None else (50.0, "Нет данных")
-    # Добавляем индекс здоровья в indicators для отображения
     indicators["market_health"] = health_index
     indicators["health_status"] = health_status
+    
+    signal_line = analysis.split("\n\nДЕТАЛЬНЫЙ АНАЛИЗ РЫНКА:")[0] if "\n\nДЕТАЛЬНЫЙ АНАЛИЗ РЫНКА:" in analysis else analysis
+    detailed_market_analysis = analysis.split("\n\nДЕТАЛЬНЫЙ АНАЛИЗ РЫНКА:")[1] if "\n\nДЕТАЛЬНЫЙ АНАЛИЗ РЫНКА:" in analysis else ""
+    
+    has_bounce_warning = "⚠️ Возможен отскок" in signal_line
+    bounce_info = ""
+    if has_bounce_warning:
+        bounce_up = "вверх" in signal_line[:signal_line.find("-")]
+        bounce_down = "вниз" in signal_line[:signal_line.find("-")]
+        
+        if "СИГНАЛ к ЛОНГУ" in signal_line or "СИГНАЛ к ШОРТУ" in signal_line:
+            bounce_color = YELLOW
+            bounce_direction = "↑" if bounce_up else "↓" if bounce_down else "↔"
+            bounce_reason = signal_line[signal_line.find("(")+1:signal_line.find(")")]
+            
+            bounce_info = (
+                f"{CYAN}┌─ ПРЕДУПРЕЖДЕНИЕ ОБ ОТСКОКЕ ─────────────────────────────┐{Style.RESET_ALL}\n"
+                f"{CYAN}│{Style.RESET_ALL} {bounce_color}⚠️ Обнаружены признаки возможного отскока {bounce_direction}{Style.RESET_ALL}\n"
+                f"{CYAN}│{Style.RESET_ALL} Причина: {bounce_reason}\n"
+                f"{CYAN}│{Style.RESET_ALL} Рекомендация: {bounce_color}Соблюдайте осторожность при входе в позицию{Style.RESET_ALL}\n"
+                f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+            )
+    
     historical_chart: str = ""
     if df is not None and len(df) > 20:
         historical_values = df["close_clean"].iloc[-20:].tolist()
@@ -1138,12 +1474,14 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
         regime_items = []
         for k, v in regimes.items():
             percentage = v * 100
-            color = GREEN if k == "0" and percentage > 60 else RED if k == "1" and percentage > 60 else YELLOW
+            color = GREEN if k == "0" and percentage > 60 else RED if k == "2" and percentage > 60 else YELLOW
+            regime_name = "Бычий" if k == "0" else "Медвежий" if k == "2" else "Нейтральный"
             regime_items.append(
-                f"{color}Режим {k}: {percentage:.1f}%{Style.RESET_ALL}")
+                f"{color}{regime_name}: {percentage:.1f}%{Style.RESET_ALL}")
         regime_str = " | ".join(regime_items)
     else:
         regime_str = f"{YELLOW}Нет данных о режимах{Style.RESET_ALL}"
+        
     vol_info = ""
     if "volume" in indicators and "vol_ma20" in indicators:
         last_vol = indicators.get("volume", 0)
@@ -1214,15 +1552,15 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
             f"{CYAN}│{Style.RESET_ALL} Макс. просадка: {risk_metrics['max_loss_pct']:.2f}%\n"
             f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
         )
-    if "СИГНАЛ к ЛОНГУ" in analysis:
+    if "СИГНАЛ к ЛОНГУ" in signal_line:
         signal_part = f"{GREEN}СИГНАЛ к ЛОНГУ{Style.RESET_ALL}"
-    elif "СИГНАЛ к ШОРТУ" in analysis:
+    elif "СИГНАЛ к ШОРТУ" in signal_line:
         signal_part = f"{RED}СИГНАЛ к ШОРТУ{Style.RESET_ALL}"
     else:
         signal_part = f"{YELLOW}РЫНОК НЕЙТРАЛЕН{Style.RESET_ALL}"
-    if "(" in analysis and ")" in analysis:
+    if "(" in signal_line and ")" in signal_line:
         try:
-            score_value = float(analysis.split("score:")[1].split(")")[0])
+            score_value = float(signal_line.split("score:")[1].split(")")[0])
         except Exception:
             score_value = 0
         strength_color = GREEN if score_value > 3 else RED if score_value < -3 else YELLOW
@@ -1230,7 +1568,7 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
         strength_index = min(int((score_value + 5) / 10 * 7), 7)
         strength_visual = strength_bars[strength_index]
         strength_part = f"{strength_color}{score_value:.1f} {strength_visual}{Style.RESET_ALL}"
-        reason_part = analysis.split("-")[1].strip() if "-" in analysis else ""
+        reason_part = signal_line.split("-")[1].strip() if "-" in signal_line else ""
     else:
         strength_part = ""
         reason_part = ""
@@ -1257,7 +1595,6 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
         f"{CYAN}│{Style.RESET_ALL} Режим: {regime_str}\n"
         f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
     )
-    # Определяем цвет для индекса здоровья
     health_idx = indicators.get("market_health", 50)
     health_status = indicators.get("health_status", "Нет данных")
     if health_idx >= 70:
@@ -1279,7 +1616,6 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
         health_color = RED
         health_symbol = "○○○○○"
     
-    # Добавляем информацию о здоровье рынка
     health_display = f"{CYAN}Здоровье рынка:{Style.RESET_ALL} {health_color}{health_idx:.1f} {health_symbol} ({health_status}){Style.RESET_ALL}"
     
     indicators_section = (
@@ -1291,6 +1627,39 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
         f"{CYAN}│{Style.RESET_ALL} {detailed_indicators}\n"
         f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
     )
+    
+    market_state_section = ""
+    if detailed_market_analysis:
+        market_points = detailed_market_analysis.strip().split("\n")
+        formatted_points = []
+        
+        for point in market_points:
+            point = point.strip()
+            if not point:
+                continue
+                
+            point = point.replace("• ", f"• {BLUE}")
+            point = point.replace("Бычий", f"{GREEN}Бычий{BLUE}")
+            point = point.replace("бычий", f"{GREEN}бычий{BLUE}")
+            point = point.replace("Медвежий", f"{RED}Медвежий{BLUE}")
+            point = point.replace("медвежий", f"{RED}медвежий{BLUE}")
+            point = point.replace("рост", f"{GREEN}рост{BLUE}")
+            point = point.replace("снижение", f"{RED}снижение{BLUE}")
+            point = point.replace("падение", f"{RED}падение{BLUE}")
+            point = point.replace("перепродан", f"{GREEN}перепродан{BLUE}")
+            point = point.replace("перекуплен", f"{RED}перекуплен{BLUE}")
+            point = point.replace("⚠️", f"{YELLOW}⚠️{BLUE}")
+            
+            formatted_points.append(f"{point}{Style.RESET_ALL}")
+        
+        market_state_text = "\n".join(formatted_points)
+        
+        market_state_section = (
+            f"{CYAN}┌─ ДЕТАЛЬНЫЙ АНАЛИЗ РЫНКА ─────────────────────────────────┐{Style.RESET_ALL}\n"
+            f"{market_state_text}\n"
+            f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
+        )
+    
     history_section = ""
     if historical_chart:
         history_section = (
@@ -1298,11 +1667,21 @@ def print_report(ticker: str, figi: str, last_close: float, raw_close: float,
             f"{historical_chart}\n"
             f"{CYAN}└────────────────────────────────────────────────────────────┘{Style.RESET_ALL}"
         )
+    
     report = (f"{header}\n"
               f"{timestamp}\n\n"
               f"{prices}\n\n"
               f"{market_analysis}\n\n"
-              f"{indicators_section}\n"
+              f"{bounce_info}\n\n" if has_bounce_warning else f"{header}\n"
+              f"{timestamp}\n\n"
+              f"{prices}\n\n"
+              f"{market_analysis}\n\n"
+              )
+    
+    if market_state_section:
+        report += f"{market_state_section}\n\n"
+    
+    report += (f"{indicators_section}\n"
               f"{history_section}\n"
               f"{risk_info}\n\n"
               f"{MAGENTA}{'=' * 70}{Style.RESET_ALL}\n")
